@@ -2,6 +2,8 @@
 
 [![Instagram: @i.erhan.es](https://img.shields.io/badge/Instagram-%40i.erhan.es-E4405F?logo=instagram&logoColor=white)](https://instagram.com/i.erhan.es)
 
+[![Instagram: @frankhashdj](https://img.shields.io/badge/Instagram-%40frankhashdj-E4405F?logo=instagram&logoColor=white)](https://instagram.com/frankhashdj)
+
 **Run the Pioneer DJ XDJ-RX3 *rekordbox* standalone player on a Denon DJ SC Live 4.**
 
 rblive4 runs the ARM32 `rekordbox` player application (`rbp`, called `rb`
