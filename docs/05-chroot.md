@@ -16,7 +16,12 @@ tree and tars it to `work/rbx3-run.tgz`:
    `getPcController` fix — see [`scripts/patch-rbp-sclive4.py`](../scripts/patch-rbp-sclive4.py)).
 4. **Shims** → `usr/lib/{fbshim,knobshim,audioshim,crashcatch}.so`.
 5. **DirectFB 1.4.16 stack** — core libs + the patched rot16 fbdev module +
-   inputdrivers/wm, in `usr/lib/directfb-1.4-6/`.
+   inputdrivers/wm, in `usr/lib/directfb-1.4-6/`. The RX3 `/lib` is a real
+   directory (not usrmerged), while DirectFB looks for modules under
+   `/lib/directfb-1.4-6`; the build adds
+   `/lib/directfb-1.4-6 → /usr/lib/directfb-1.4-6` (and `-1.4-0`). Without
+   them `DirectFBCreate()` fails (`dfb_core_create ret=17`) and rbp crashes
+   in its display driver.
 6. **`usr/etc/directfbrc`** (`no-hardware`/`no-cursor`/`system=fbdev`/
    `fbdev=/dev/fb0`) and **`root/settings/TouchCalib_{User,Factory}.dat`**.
 7. Fixes exec bits and the `etc/mtab → /proc/mounts` symlink.
@@ -28,14 +33,40 @@ and `$HOME/chromebit`); the output goes to `work/`.
 RX3=/path/to/xdjrx3-findings scripts/build-chroot.sh   # -> work/rbx3-run.tgz
 ```
 
+**Always rebuild the tarball after changing a shim.** The tarball bundles the
+compiled `.so` files from `scripts/shims/`, not the sources. `build-chroot.sh`
+rebuilds them automatically when a `.c` or the `Makefile` is newer than the
+corresponding `.so`, but a tarball built earlier keeps stale shims; deploying
+one makes a shim fix appear to have no effect. Check before deploying:
+
+```sh
+make -C scripts/shims RX3=... check
+stat -c '%y %n' scripts/shims/*.c scripts/shims/*.so work/rbx3-run.tgz
+```
+
 ## Deploy
 
-The device's busybox `tar` has **no `-z`**, so decompress with `zcat`:
+The device's busybox `tar` has **no `-z`**, so decompress with `zcat`.
+
+> **Unmount the chroot binds before deleting the tree.** `/data/rbx3-run/dev`
+> is a bind mount of the host `/dev`. `rm -rf /data/rbx3-run` while it is
+> mounted deletes the device's real device nodes: `/dev/null` becomes a plain
+> file, `/dev/urandom` disappears and **sshd resets every new connection**
+> (needs a reboot to recover). `fix-dev.sh` now refuses to continue if a bind
+> is still mounted, but the deploy command must unmount too.
 
 ```sh
 scp work/rbx3-run.tgz root@sclive4:/data/
-ssh root@sclive4 'rm -rf /data/rbx3-run; mkdir -p /data/rbx3-run
-  zcat /data/rbx3-run.tgz | tar x -C /data/rbx3-run
+ssh root@sclive4 '
+  sh /data/stop-rbp
+  for m in dev proc sys tmp; do
+    mountpoint -q /data/rbx3-run/$m && umount /data/rbx3-run/$m
+    mountpoint -q /data/rbx3-run/$m && { echo "$m still mounted" >&2; exit 1; }
+  done
+  rm -rf /data/rbx3-run.new; mkdir -p /data/rbx3-run.new
+  zcat /data/rbx3-run.tgz | tar x -C /data/rbx3-run.new
+  rm -rf /data/rbx3-run
+  mv /data/rbx3-run.new /data/rbx3-run
   chown -R root:root /data/rbx3-run
   sh /data/fix-dev.sh'
 ```

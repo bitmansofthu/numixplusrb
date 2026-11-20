@@ -27,7 +27,7 @@ Build a single target during development, e.g.
 |---|---|---|
 | `fbshim-tsc.c` → `fbshim.so` | fb ioctl shim (1280×800 RGB565 logical fb, 60 fps pacing) + tsc2007 touch emulation from `/dev/input/event0` | used as-is |
 | `knobshim2.c` → `knobshim.so` | SC Live 4 MIDI control surface → rbp keycodes, plus panel LED and VU output | **SC Live 4-specific** |
-| `audioshim.c` → `audioshim.so` | presents the RX3 ALSA devices over the JP21 `hw:1,0` codec | **SC Live 4-specific** |
+| `audioshim.c` → `audioshim.so` | presents the RX3 ALSA devices over JP21 (SC Live 4) or NH08 (Mixstream Pro) `hw:1,0`; layout is configurable | **device-specific mapping** |
 | `crashcatch.c` → `crashcatch.so` | SIGSEGV `pc`/`lr` → `/tmp/crash.log` | diagnostic |
 | `seqinject2.c` → `seqinject2` | static helper: inject MIDI into the shim's sequencer port | diagnostic |
 | `udplog.c` → `udplog` | static UDP listener for rbp's DebugLog → `/data/rbp-debug.log` | diagnostic |

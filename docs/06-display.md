@@ -53,9 +53,32 @@ All supplied by the shared RK3288 display build (see
 
 Rotation is selected at runtime with `DFB_ROTATE=left`.
 
+## Module path
+
+DirectFB 1.4.16 looks for modules in `/lib/directfb-1.4-6`, but the RX3 rootfs
+keeps `/lib` separate from `/usr/lib`. `scripts/build-chroot.sh` creates
+
+```
+/lib/directfb-1.4-6 -> /usr/lib/directfb-1.4-6
+/lib/directfb-1.4-0 -> /usr/lib/directfb-1.4-0
+```
+
+Without them DirectFBCreate fails (`dfb_core_create ret=17`,
+`opendir /lib/directfb-1.4-6/systems failed`) and rbp crashes in
+`DS_HW_Glib3_DFB.c` with `addr=0x30`.
+
+## Blank state
+
+Engine stops with `/sys/class/graphics/fb0/blank = 4` (powerdown).
+`start-rb.sh` writes `0` before launching rbp; with the panel blanked the
+first DirectFB surface setup is unreliable.
+
 ## Notes
 
 * Do **not** set `layer-size` or `layer-rotate` in `directfbrc`.
 * The DRM fb cannot pan; the driver falls back to `FRONTONLY` and keeps the
   real `yres_virtual`.
-* Rotation direction: `DFB_ROTATE=left` (90° CCW). Wrong value = UI sideways.
+* Rotation direction: the SC Live 4 uses `DFB_ROTATE=left`; on the Mixstream
+  Pro Plus that renders the UI **upside down**, so `start-rb.sh` defaults to
+  `DFB_ROTATE=right` there. Override with `DFB_ROTATE=left|right` for other
+  panels. A wrong value shows the UI sideways or inverted, not garbled.

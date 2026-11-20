@@ -138,11 +138,121 @@ static void init_real_alsa(void)
     alog("audioshim: real ALSA initialized\n");
 }
 
-/* 8-channel audio buffer for SC Live 4 (JP21): ch0/1 master, ch2/3 headphones,
- * ch6/7 built-in speakers (S24_LE: 4 bytes/sample) */
+/* Output layout.  Defaults are the Numark Mixstream Pro (NH08):
+ *   ch0/1 = master, ch2/3 = headphones, ch4/5 = built-in speakers.
+ * A 4-channel PCM leaves the speaker DAI out entirely (the kernel machine
+ * driver sets its channels_min to 0), so phase 1 does not touch the amp.
+ * Set AUDIO_CHANNELS=6 to include the speaker slots, and AUDIO_SPEAKERS=0
+ * to open 6 channels but keep the speaker slots silent.
+ *
+ * The SC Live 4 (JP21) layout is still reachable:
+ *   AUDIO_CHANNELS=8 AUDIO_HP_OFFSET=4 AUDIO_SPEAKER_OFFSET=6
+ * (it also has a booth pair at 2/3, which this shim does not feed.)
+ *
+ * All offsets are in interleaved L/R pairs.  They can be overridden for
+ * bring-up if the master/headphone pair turns out to be swapped:
+ *   AUDIO_MASTER_OFFSET=2 AUDIO_HP_OFFSET=0
+ */
 #define MAX_FRAMES 4096
-static int32_t g_mix8ch[MAX_FRAMES * 8];
+#define MAX_OUTPUT_CHANNELS 8
+
+static int g_out_channels = 4;
+static int g_master_offset = 0;
+static int g_hp_offset = 2;
+static int g_speaker_offset = 4;
+static int g_speakers_enabled = -1;   /* -1 = auto (on when slots exist) */
+static char g_device[128] = "hw:1,0";
+static int g_config_initialized = 0;
+
+static int32_t g_mixch[MAX_FRAMES * MAX_OUTPUT_CHANNELS];
 static unsigned long g_write_count = 0;
+
+static int env_int(const char *name, int def)
+{
+    const char *s = getenv(name);
+    return (s && *s) ? atoi(s) : def;
+}
+
+static int pairs_overlap(int a, int b)
+{
+    return a >= 0 && b >= 0 && a < b + 2 && b < a + 2;
+}
+
+static void audio_config_init(void)
+{
+    if (g_config_initialized) return;
+    g_config_initialized = 1;
+
+    const char *s = getenv("AUDIO_DEVICE");
+    if (s && *s)
+        snprintf(g_device, sizeof(g_device), "%s", s);
+
+    int channels = env_int("AUDIO_CHANNELS", 4);
+    if (channels < 2 || channels > MAX_OUTPUT_CHANNELS || (channels & 1)) {
+        alog("audioshim: invalid AUDIO_CHANNELS=%d, using 4\n", channels);
+        channels = 4;
+    }
+    g_out_channels = channels;
+
+    g_master_offset = env_int("AUDIO_MASTER_OFFSET", 0);
+    g_hp_offset = env_int("AUDIO_HP_OFFSET", 2);
+    g_speaker_offset = env_int("AUDIO_SPEAKER_OFFSET", 4);
+
+    if (g_master_offset < 0 ||
+        g_master_offset + 2 > g_out_channels) {
+        alog("audioshim: invalid AUDIO_MASTER_OFFSET=%d, using 0\n",
+             g_master_offset);
+        g_master_offset = 0;
+    }
+    if (g_hp_offset >= 0 && g_hp_offset + 2 > g_out_channels) {
+        alog("audioshim: headphone slots %d/%d do not fit in %d channels\n",
+             g_hp_offset, g_hp_offset + 1, g_out_channels);
+        g_hp_offset = -1;
+    }
+    if (g_speaker_offset >= 0 &&
+        g_speaker_offset + 2 > g_out_channels) {
+        if (env_int("AUDIO_SPEAKERS", 0) != 0)
+            alog("audioshim: speaker slots %d/%d need at least %d channels\n",
+                 g_speaker_offset, g_speaker_offset + 1,
+                 g_speaker_offset + 2);
+        g_speaker_offset = -1;
+    }
+
+    if (pairs_overlap(g_master_offset, g_hp_offset)) {
+        alog("audioshim: headphone slots overlap master slots; disabling hp\n");
+        g_hp_offset = -1;
+    }
+    if (pairs_overlap(g_master_offset, g_speaker_offset) ||
+        pairs_overlap(g_hp_offset, g_speaker_offset)) {
+        alog("audioshim: speaker slots overlap another output; disabling speakers\n");
+        g_speaker_offset = -1;
+    }
+
+    s = getenv("AUDIO_SPEAKERS");
+    if (s && *s)
+        g_speakers_enabled = (atoi(s) != 0);
+    else
+        g_speakers_enabled = (g_speaker_offset >= 0);
+    if (g_speaker_offset < 0)
+        g_speakers_enabled = 0;
+
+    char hp_desc[32], spk_desc[32];
+    if (g_hp_offset >= 0)
+        snprintf(hp_desc, sizeof(hp_desc), "%d/%d",
+                 g_hp_offset, g_hp_offset + 1);
+    else
+        snprintf(hp_desc, sizeof(hp_desc), "off");
+    if (g_speakers_enabled)
+        snprintf(spk_desc, sizeof(spk_desc), "%d/%d",
+                 g_speaker_offset, g_speaker_offset + 1);
+    else
+        snprintf(spk_desc, sizeof(spk_desc), "off");
+
+    alog("audioshim: layout device=%s channels=%d master=%d/%d hp=%s speakers=%s\n",
+         g_device, g_out_channels,
+         g_master_offset, g_master_offset + 1,
+         hp_desc, spk_desc);
+}
 
 /* shared with knobshim2.so (booth/speaker knob, CC15 ch15) */
 extern volatile float g_speaker_gain;
@@ -228,16 +338,17 @@ static inline int is_real(snd_pcm_t *pcm)
 int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
 {
     init_real_alsa();
+    audio_config_init();
     alog("audioshim: snd_pcm_open(name='%s', stream=%d, mode=%d)\n", name ? name : "null", stream, mode);
 
     if (stream == SND_PCM_STREAM_PLAYBACK) {
         if (g_playback_open_count == 0) {
-            /* Output 0: Master -> Real hw:1,0 */
+            /* Output 0: Master -> real hardware */
             if (!g_real_playback && real_snd_pcm_open) {
                 int real_mode = mode & ~2; /* mask out SND_PCM_NONBLOCK so hardware paces audio clock */
-                int err = real_snd_pcm_open(&g_real_playback, "hw:1,0", SND_PCM_STREAM_PLAYBACK, real_mode);
-                alog("audioshim: opened real hw:1,0 for Master (mode=%d->%d), res=%d handle=%p\n",
-                     mode, real_mode, err, g_real_playback);
+                int err = real_snd_pcm_open(&g_real_playback, g_device, SND_PCM_STREAM_PLAYBACK, real_mode);
+                alog("audioshim: opened real %s for Master (mode=%d->%d), res=%d handle=%p\n",
+                     g_device, mode, real_mode, err, g_real_playback);
                 if (err < 0) {
                     err = real_snd_pcm_open(&g_real_playback, "default", SND_PCM_STREAM_PLAYBACK, real_mode);
                     alog("audioshim: fallback open 'default' res=%d handle=%p\n", err, g_real_playback);
@@ -253,8 +364,8 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
             g_playback_open_count++;
             return 0;
         } else if (g_playback_open_count == 2) {
-            /* Output 2: Booth -> Virtual handle */
-            alog("audioshim: mapped virtual Booth device\n");
+            /* Output 2: Booth -> Virtual handle (discarded on NH08) */
+            alog("audioshim: mapped virtual Booth device (no output)\n");
             *pcm = (snd_pcm_t *)&g_h_booth;
             g_playback_open_count++;
             return 0;
@@ -320,10 +431,11 @@ int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, in
 int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int val)
 {
     init_real_alsa();
-    alog("audioshim: set_channels req=%u -> setting 8ch on hw\n", val);
+    audio_config_init();
+    alog("audioshim: set_channels req=%u -> setting %dch on hw\n", val, g_out_channels);
     if (is_real(pcm) && real_snd_pcm_hw_params_set_channels) {
-        int err = real_snd_pcm_hw_params_set_channels(g_real_playback, params, 8);
-        alog("audioshim: real set_channels(8) res=%d\n", err);
+        int err = real_snd_pcm_hw_params_set_channels(g_real_playback, params, g_out_channels);
+        alog("audioshim: real set_channels(%d) res=%d\n", g_out_channels, err);
         return err;
     }
     return 0;
@@ -497,6 +609,7 @@ int snd_pcm_link(snd_pcm_t *pcm1, snd_pcm_t *pcm2)
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
 {
     init_real_alsa();
+    audio_config_init();
     if (!buffer || size == 0) return size;
 
     if (size > MAX_FRAMES)
@@ -527,18 +640,25 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     if (pcm == (snd_pcm_t *)&g_h_booth) {
-        /* Booth stream (rbp device 2) -> Ch 2/3 (booth out) */
-        for (snd_pcm_uframes_t i = 0; i < size; i++) {
-            g_mix8ch[i * 8 + 2] = (int32_t)(src[i * 2 + 0] << 8) >> 8;
-            g_mix8ch[i * 8 + 3] = (int32_t)(src[i * 2 + 1] << 8) >> 8;
+        /* rbp's booth stream has no output path on NH08.  Discard it so it
+         * cannot clobber the headphone slots (2/3 on the Mixstream Pro). */
+        static int booth_logged = 0;
+        if (!booth_logged) {
+            booth_logged = 1;
+            alog("audioshim: booth stream discarded (no booth output)\n");
         }
         return size;
     }
     if (pcm == (snd_pcm_t *)&g_h_dummy)
         return size;
 
-    /* Master stream: interleave into Ch 0 (Left) and Ch 1 (Right) */
-    float sg_target = g_speaker_on ? speaker_gain() : 0.0f;
+    int master_off = g_master_offset;
+    int hp_off = g_hp_offset;
+    int spk_off = g_speakers_enabled ? g_speaker_offset : -1;
+
+    /* Master stream: interleave into the configured master, headphone and
+     * (optionally) speaker slots. */
+    float sg_target = (spk_off >= 0 && g_speaker_on) ? speaker_gain() : 0.0f;
     float cue_mix = g_cue_mix;
     float cue_gain = g_cue_gain;
     float master_gain = g_master_gain;
@@ -549,7 +669,22 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     if (master_gain < 0.0f) master_gain = 0.0f;
     if (master_gain > 1.0f) master_gain = 1.0f;
     static float env_l = 0.0f, env_r = 0.0f;
+    /* Per-block VU release.  The old fixed 0.995 took ~300 ms to fall 60 dB
+     * (one block is ~1.45 ms), which made the panel meters feel sluggish.
+     * 0.98 falls in ~70 ms; VU_RELEASE=<factor> overrides it at startup. */
+    static float vu_release = 0.0f;
+    static int vu_release_init = 0;
+    if (!vu_release_init) {
+        const char *s = getenv("VU_RELEASE");
+        vu_release_init = 1;
+        vu_release = (s && *s) ? (float)atof(s) : 0.98f;
+        if (vu_release < 0.5f)
+            vu_release = 0.5f;
+        if (vu_release > 1.0f)
+            vu_release = 1.0f;
+    }
     int32_t bl = 0, br = 0;
+    memset(g_mixch, 0, (size_t)size * g_out_channels * sizeof(g_mixch[0]));
     for (snd_pcm_uframes_t i = 0; i < size; i++) {
         int32_t l = src[i * 2 + 0];
         int32_t r = src[i * 2 + 1];
@@ -569,30 +704,35 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         }
         /* Scale the TRUE signed 24-bit values (sl/sr).  Scaling the raw word
          * would corrupt negative samples, whose top byte is 0 here. */
-        g_mix8ch[i * 8 + 0] = (int32_t)(sl * master_gain);  /* XLR/main L */
-        g_mix8ch[i * 8 + 1] = (int32_t)(sr * master_gain);  /* XLR/main R */
+        g_mixch[i * g_out_channels + master_off + 0] =
+            (int32_t)(sl * master_gain);  /* main L */
+        g_mixch[i * g_out_channels + master_off + 1] =
+            (int32_t)(sr * master_gain);  /* main R */
         /* ramp the speaker gain per-sample so knob moves don't create a
          * block-rate staircase (689 Hz buzz heard as "noise") */
-        g_sg_cur += (sg_target - g_sg_cur) * 0.0008f;
-        g_mix8ch[i * 8 + 6] = (int32_t)(sl * g_sg_cur);  /* speakers L */
-        g_mix8ch[i * 8 + 7] = (int32_t)(sr * g_sg_cur);  /* speakers R */
-        /* Headphone out is Ch 4/5 (verified on-device): blend rbp's cue bus
-         * with the master per the cue-mix knob, then apply the cue level. */
+        if (spk_off >= 0) {
+            g_sg_cur += (sg_target - g_sg_cur) * 0.0008f;
+            g_mixch[i * g_out_channels + spk_off + 0] =
+                (int32_t)(sl * g_sg_cur);  /* speakers L */
+            g_mixch[i * g_out_channels + spk_off + 1] =
+                (int32_t)(sr * g_sg_cur);  /* speakers R */
+        }
         /* rbp's phone stream is its headphone bus.  With rbp's MASTER CUE
-         * enabled the bus contains cue + master, which rbp mixes internally
-         * (time-aligned) - so route it straight through instead of summing
+         * enabled the bus contains cue + master, already mixed and
+         * time-aligned by rbp - route it straight through instead of summing
          * the separate master/cue streams here (that combed). */
-        g_mix8ch[i * 8 + 4] = g_cue[i * 2 + 0];
-        g_mix8ch[i * 8 + 5] = g_cue[i * 2 + 1];
-        /* rbp's BOOTH stream owns Ch 2/3 (written in its own branch) */
+        if (hp_off >= 0) {
+            g_mixch[i * g_out_channels + hp_off + 0] = g_cue[i * 2 + 0];
+            g_mixch[i * g_out_channels + hp_off + 1] = g_cue[i * 2 + 1];
+        }
     }
 
     g_write_count++;
 
-    /* publish decaying master peaks for the panel VU meters (~1.45 ms/block,
-     * 0.995 per block gives a ~300 ms release) */
-    env_l = ((float)bl > env_l) ? (float)bl : env_l * 0.995f;
-    env_r = ((float)br > env_r) ? (float)br : env_r * 0.995f;
+    /* publish decaying master peaks for the panel VU meters; the attack is
+     * immediate and the release is VU_RELEASE per block (default 0.98) */
+    env_l = ((float)bl > env_l) ? (float)bl : env_l * vu_release;
+    env_r = ((float)br > env_r) ? (float)br : env_r * vu_release;
     g_vu_peak[0] = (int)env_l;
     g_vu_peak[1] = (int)env_r;
 
@@ -621,8 +761,9 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
                 else
                     g = 1.0f;
                 if (g >= 1.0f) continue;
-                for (int c = 0; c < 8; c++)
-                    g_mix8ch[i * 8 + c] = (int32_t)((float)g_mix8ch[i * 8 + c] * g);
+                for (int c = 0; c < g_out_channels; c++)
+                    g_mixch[i * g_out_channels + c] =
+                        (int32_t)((float)g_mixch[i * g_out_channels + c] * g);
             }
         }
         if (!g_startup_logged_open && mute > 0 && g_startup_frames_done >= mute + fade) {
@@ -633,13 +774,13 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     snd_pcm_sframes_t written = 0;
-    /* Output all 8 channels to real hardware */
+    /* Output all configured channels to real hardware */
     if (g_real_playback && real_snd_pcm_writei) {
-        written = real_snd_pcm_writei(g_real_playback, g_mix8ch, size);
+        written = real_snd_pcm_writei(g_real_playback, g_mixch, size);
         if (written < 0) {
             if (real_snd_pcm_prepare)
                 real_snd_pcm_prepare(g_real_playback);
-            written = real_snd_pcm_writei(g_real_playback, g_mix8ch, size);
+            written = real_snd_pcm_writei(g_real_playback, g_mixch, size);
         }
     } else {
         /* Safety sleep to pace real-time audio threads if hardware is delayed */
@@ -647,8 +788,9 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     if ((g_write_count % 500) == 1) {
-        alog("audioshim: writei #%lu frames=%lu written=%ld peak_m=%d peak_hp=%d sg=%.4f cm=%.4f cg=%.4f\n",
-             g_write_count, size, (long)written, s_peak_master, s_peak_hp,
+        alog("audioshim: writei #%lu frames=%lu ch=%d written=%ld peak_m=%d peak_hp=%d sg=%.4f cm=%.4f cg=%.4f\n",
+             g_write_count, size, g_out_channels, (long)written,
+             s_peak_master, s_peak_hp,
              (double)speaker_gain(), (double)g_cue_mix, (double)g_cue_gain);
         /* cue/master alignment diagnostic removed (direct routing) */
         s_peak_master = 0;

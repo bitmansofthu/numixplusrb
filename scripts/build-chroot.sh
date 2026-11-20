@@ -57,13 +57,22 @@ if [ -n "$missing" ]; then
 fi
 
 # --- build the shims from source if needed ---------------------------------
+# Rebuild when a .so is missing OR older than any shim source/Makefile.
+# Otherwise a stale prebuilt shim silently ends up in the tarball, which
+# looks exactly like "the fix did nothing" after deployment.
+need_make=0
 for so in knobshim2.so audioshim.so fbshim-tsc.so; do
   if [ ! -f "$SHIMS/$so" ]; then
-    echo "== building shims (make -C scripts/shims) =="
-    make -C "$SHIMS" RX3="$ROOTFS"
-    break
+    need_make=1
+  elif [ -n "$(find "$SHIMS" -maxdepth 1 \( -name '*.c' -o -name 'Makefile' \) \
+              -newer "$SHIMS/$so" -print -quit)" ]; then
+    need_make=1
   fi
 done
+if [ "$need_make" -eq 1 ]; then
+  echo "== building shims (make -C scripts/shims) =="
+  make -C "$SHIMS" RX3="$ROOTFS" -B knobshim2.so audioshim.so fbshim-tsc.so
+fi
 if [ ! -f "$SHIMS/knobshim2.so" ] || [ ! -f "$SHIMS/audioshim.so" ] || \
    [ ! -f "$SHIMS/fbshim-tsc.so" ]; then
   echo "build-chroot: shims are missing in $SHIMS (build failed?)" >&2
@@ -116,6 +125,13 @@ cp "$DFBLIB/libfusion-1.4.so.0.0.0"   "$STAGE/usr/lib/libfusion-1.4.so.0.0.0"
 ln -sfn libdirectfb-1.4.so.0.0.0 "$STAGE/usr/lib/libdirectfb-1.4.so.0"
 ln -sfn libdirect-1.4.so.0.0.0   "$STAGE/usr/lib/libdirect-1.4.so.0"
 ln -sfn libfusion-1.4.so.0.0.0   "$STAGE/usr/lib/libfusion-1.4.so.0"
+
+# DirectFB's module loader is compiled with MODULE_DIR=/lib/directfb-1.4-6,
+# but the RX3 /lib is a real directory (not usrmerged), so it never finds the
+# modules under /usr/lib. Without these links DirectFBCreate() fails with
+# dfb_core_create ret=17 and rbp crashes in DS_HW_Glib3_DFB.c.
+ln -sfn /usr/lib/directfb-1.4-6 "$STAGE/lib/directfb-1.4-6"
+ln -sfn /usr/lib/directfb-1.4-0 "$STAGE/lib/directfb-1.4-0"
 
 mkdir -p "$STAGE/usr/lib/directfb-1.4-6/systems" \
          "$STAGE/usr/lib/directfb-1.4-6/inputdrivers" \

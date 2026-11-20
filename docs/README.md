@@ -13,10 +13,12 @@ Documentation for the XDJ-RX3 `rb` → Denon SC Live 4 port.
 | 06 | [display](06-display.md) | DirectFB fbdev on the 800×1280 portrait panel + `directfbrc` |
 | 07 | [touch](07-touch.md) | ILI2117 → tsc2007 shim + TouchCalib |
 | 08 | [controls](08-controls.md) | SC Live 4 MIDI → rbp keycodes, LEDs, VU |
-| 09 | [audio](09-audio.md) | JP21 8-channel codec + built-in speakers |
+| 09 | [audio](09-audio.md) | NH08 4/6-channel (Mixstream) and JP21 8-channel (SC Live 4) layouts |
 | 10 | [usb](10-usb.md) | USB stick + rekordbox database |
 | 11 | [runtime-launcher](11-runtime-launcher.md) | launch sequence / systemd integration |
 | 12 | [troubleshooting](12-troubleshooting.md) | symptom → cause → fix |
+| 13 | [mixstream-pro-plus-roadmap](13-mixstream-pro-plus-roadmap.md) | Mixstream Pro Plus port feasibility and phased bring-up plan |
+| 14 | [mixstream-pro-plus-survey](14-mixstream-pro-plus-survey.md) | live Mixstream Pro Plus survey (NH08S platform, audio, MIDI, services) |
 
 The matching PrimeBox doc is the upstream reference for anything shared; links
 are in [03-port-plan.md](03-port-plan.md).

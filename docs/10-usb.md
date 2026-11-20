@@ -32,6 +32,38 @@ stick (usb1, 1-1) → sda/sda1
   library → USB 1 appears in Source / Browse
 ```
 
+Both USB-A ports work; the watcher publishes either as **USB1** (it always
+uses `/media/usb1/sda1`). Inserting the stick updates rbp's detect/media
+state (visible as `knobshim2: USB1 detected -> registered (dev=3)`).
+
+Sticks are named by the kernel in attach order, so a second insert (or a
+different stick while the first was pulled) can appear as `sdb1`. `attach()`
+compares the mount's real source (`/proc/mounts`) with the current partition:
+if `/media/usb1/sda1` is still mounted from a vanished `/dev/sda1`, it logs
+`stale (…, want /dev/sdb1) -> remounting`, drops the dead mount and mounts the
+new device. A watcher restart with no media present also cleans a stale
+`/media/usb1/sda1` (`detach: stale … with no media device`). Without this,
+rbp keeps reading the dead tree and the kernel logs
+`FAT-fs (sda1): Directory bread(block …) failed`.
+
+## Selecting the source (Mixstream Pro Plus)
+
+The XDJ-RX3 has a hardware **SOURCE** button; the Mixstream does not, and its
+Engine-OS source picker is touch-only. rbp ignores touch in this menu, so
+`knobshim2.c` supplies the key:
+
+1. With a mounted stick and **no source selected**, pushing the **Browse**
+   knob opens the SOURCE menu (sends `K_SOURCE 0x0201`).
+2. With the SOURCE menu open, pushing **Browse** selects **USB1** (sends
+   `K_USB1 0x0209`); the track list populates.
+3. **SoundSwitch (note 34, ch15)** is repurposed as a SOURCE button, so the
+   menu can be reopened at any time (also selects USB1 with a second Browse
+   push).
+
+The detection uses rbp's live state: `browseMode` at `0x326f8b8`,
+browse device at `0x326f8bc` (0 = none, 3 = USB1) and the mounted
+`PIONEER/rekordbox/export.pdb`.
+
 ## Files
 
 * `scripts/device/usb-watch.sh` — hotplug watcher (SC Live 4 buses), shipped to

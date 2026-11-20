@@ -105,9 +105,22 @@ attach() {
   dev=$1
   part=$(find_partition "$dev") || { log "attach: no usable partition on $dev"; return 1; }
 
+  src=""
   if mountpoint -q "$MNT"; then
-    log "attach: $MNT already mounted (refreshing bind only)"
+    src=$(awk -v m="$MNT" '$2 == m { print $1; exit }' /proc/mounts)
+  fi
+  if [ "$src" = "/dev/$part" ]; then
+    log "attach: $MNT already mounted from /dev/$part (refreshing bind only)"
   else
+    # A pulled stick, or a watcher restart, can leave $MNT pointing at a
+    # device that is gone (sda1) while the new one enumerated as sdb1.
+    # Mounting over it would keep rbp reading the dead tree, so drop the
+    # stale mount first (lazy: rbp may still hold a directory handle).
+    if [ -n "$src" ]; then
+      log "attach: $MNT is stale ($src, want /dev/$part) -> remounting"
+      if mountpoint -q "$CH_MNT"; then umount -l "$CH_MNT" 2>/dev/null; fi
+      umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null
+    fi
     fstype=$(blkid -s TYPE -o value "/dev/$part" 2>/dev/null)
     [ -n "$fstype" ] || fstype=vfat
     mkdir -p "$MNT"
@@ -153,7 +166,7 @@ detach() {
   rmdir "$MNT" 2>/dev/null
 }
 
-rbp_pid() { ps w | awk '/\/root\/pdj\/rbp/ && !/sh -c/ && !/strace/ && !/awk/ {print $1; exit}'; }
+rbp_pid() { ps -e -o pid,args | awk '/\/root\/pdj\/rbp/ && !/sh -c/ && !/strace/ && !/awk/ {print $1; exit}'; }
 
 run() {
   log "=== usb-watch run: watching buses [$BUSES], poll ${POLL}s ==="
@@ -181,6 +194,11 @@ run() {
       if [ -n "$cur" ]; then
         detach
         cur=""
+      elif mountpoint -q "$MNT"; then
+        # No media device on the watched buses but something is still
+        # mounted: the stick was pulled while the watcher was down.
+        log "detach: stale $MNT with no media device"
+        detach
       fi
     fi
     last_rbp=$rbp

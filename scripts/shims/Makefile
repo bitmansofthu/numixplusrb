@@ -22,14 +22,16 @@ RX3ULIB := $(RX3)/usr/lib
 # (dev-only archives); give the linker empty stubs so -lpthread links.
 COMPAT  ?= compat
 
+# The cross gcc predefines _FILE_OFFSET_BITS=64 (and _TIME_BITS=64).  With
+# those on 32-bit ARM, <fcntl.h> redirects `open` to the symbol `open64`, so
+# an interposer defining both open() and open64() emits the symbol `open64`
+# twice ("symbol `open64' is already defined") and plain open() is no longer
+# interposed at all.  Undefine both; this also matches the 32-bit off_t of the
+# soft-float glibc-2.13 runtime the shims are preloaded into.
 CFLAGS  := -O2 -march=armv5t -mfloat-abi=soft -fno-stack-protector -fPIC \
+           -U_FILE_OFFSET_BITS -U_TIME_BITS \
            -Wall -Wextra -Wno-unused-parameter
 LDFLAGS := -L$(COMPAT) -L$(RX3LIB) -L$(RX3ULIB) -Wl,-rpath-link,$(RX3LIB):$(RX3ULIB)
-
-$(COMPAT)/libc_nonshared.a $(COMPAT)/libpthread_nonshared.a:
-	@mkdir -p $(COMPAT)
-	@ar rcs $(COMPAT)/libc_nonshared.a
-	@ar rcs $(COMPAT)/libpthread_nonshared.a
 
 # Shared LD_PRELOAD libraries (soft-float, libc-only NEEDED)
 SHARED  := knobshim2.so audioshim.so fbshim-tsc.so gpioshim.so tscshim.so crashcatch.so
@@ -37,8 +39,15 @@ SHARED  := knobshim2.so audioshim.so fbshim-tsc.so gpioshim.so tscshim.so crashc
 # Static ARM helpers (have no soft-float runtime dependency)
 STATIC  := seqinject2 udplog
 
+# Must be the first rule in the file: bare `make` builds the first target
+# only, so `all` has to precede the compat-stub rule below.
 .PHONY: all clean check
 all: $(SHARED) $(STATIC)
+
+$(COMPAT)/libc_nonshared.a $(COMPAT)/libpthread_nonshared.a:
+	@mkdir -p $(COMPAT)
+	@ar rcs $(COMPAT)/libc_nonshared.a
+	@ar rcs $(COMPAT)/libpthread_nonshared.a
 
 # knobshim2 needs the ALSA sequencer headers; host headers are fine as the
 # structs are ABI-stable.

@@ -44,13 +44,23 @@ DirectFB stack.
 
 ## 3. Deploy (device)
 
-The device busybox `tar` has no `-z`, so use `zcat`:
+The device busybox `tar` has no `-z`, so use `zcat`. Unmount the chroot
+binds first: `/data/rbx3-run/dev` is a bind of the host `/dev`, and deleting
+the tree while it is mounted erases the device's `/dev` (sshd then resets
+every connection until reboot).
 
 ```sh
 scp work/rbx3-run.tgz root@<device>:/data/
 ssh root@<device> '
-  rm -rf /data/rbx3-run; mkdir -p /data/rbx3-run
-  zcat /data/rbx3-run.tgz | tar x -C /data/rbx3-run
+  sh /data/stop-rbp
+  for m in dev proc sys tmp; do
+    mountpoint -q /data/rbx3-run/$m && umount /data/rbx3-run/$m
+    mountpoint -q /data/rbx3-run/$m && { echo "$m still mounted" >&2; exit 1; }
+  done
+  rm -rf /data/rbx3-run.new; mkdir -p /data/rbx3-run.new
+  zcat /data/rbx3-run.tgz | tar x -C /data/rbx3-run.new
+  rm -rf /data/rbx3-run
+  mv /data/rbx3-run.new /data/rbx3-run
   chown -R root:root /data/rbx3-run
   sh /data/fix-dev.sh'
 ```

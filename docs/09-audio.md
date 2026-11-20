@@ -1,9 +1,83 @@
-# 09 — Audio (JP21 8-channel codec)
+# 09 — Audio (JP21 / NH08 codecs)
+
+`audioshim.so` supports two codec layouts: the SC Live 4 (JP21, 8-channel)
+and the Numark Mixstream Pro / Pro Plus (NH08/NH08S, 6 channels: master,
+headphones and the built-in speaker amp). The shim defaults to the NH08
+layout;
+[`start-rb.sh`](../scripts/device/start-rb.sh) selects JP21 or NH08/NH08S from
+the device tree product code, and the layout is also overridable with
+environment variables (see below).
+
+## NH08 / Mixstream Pro channel map
+
+`hw:1,0` is the NH08 card. The kernel machine driver exposes at most 6
+channels: the master codec owns slots 0–3 and the ETA5805 speaker amp owns
+slots 4/5. On the Mixstream Pro Plus the amp is an **ETA5805**
+(`eta5805@2f` in dmesg); the stock UCM (`/usr/share/alsa/ucm2/NH08/`) exposes
+TAS5805M-class controls for it.
+
+| Channels | Output |
+|---|---|
+| **0/1** | **master out** |
+| **2/3** | **headphones** |
+| **4/5** | built-in speakers (only when a 5/6-channel PCM is requested) |
+
+When the PCM is opened with 4 channels, `nh08_hw_params()` sets the speaker
+DAI's `channels_min` to 0, so the speaker amp is not part of the PCM at all.
+With 6 channels the master codec gets TDM mask `0xF` (slots 0–3) and the
+speaker amp gets `0x30` (slots 4/5). **The launcher therefore opens 6
+channels on NH08/NH08S by default** (`DEF_CHANNELS=6`); measured on the Pro
+Plus: `S24_LE, 6 ch, 44100`, period 64, buffer 128, RUNNING.
+
+The ETA5805 has its own volume knob and no hardware on/off switch. A
+6-channel PCM feeds it slots 4/5 with the main mix (the speaker path is a
+separate amplifier DAI, not a hardware mirror of the main DAC). The stock UCM
+(`/usr/share/alsa/ucm2/NH08/`) targets a TAS5805M control set that the
+ETA5805 card does not expose, so `alsaucm -c NH08 set _verb HiFi` fails with
+`unable to execute cset 'Input Mixer'` on this device. The amp keeps the
+configuration the kernel/Engine left at boot; verify audibly. The shim's
+software speaker level follows the physical speaker knob (CC17). If the
+hardware knob should be the only speaker level control, set
+`SPEAKER_GAIN=1.0` to pin the shim's software gain.
+
+### Layout environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AUDIO_DEVICE` | `hw:1,0` | ALSA playback device |
+| `AUDIO_CHANNELS` | `6` | 2 = master only, 4 = master + headphones, 6 = add speakers |
+| `AUDIO_MASTER_OFFSET` | `0` | first master channel |
+| `AUDIO_HP_OFFSET` | `2` | first headphone channel (`-1` = none) |
+| `AUDIO_SPEAKER_OFFSET` | `4` | first speaker channel |
+| `AUDIO_SPEAKERS` | auto | `0` opens 6 channels but leaves speaker slots silent |
+
+If a bring-up test shows that the master and headphone pairs are reversed,
+set `AUDIO_MASTER_OFFSET=2 AUDIO_HP_OFFSET=0`.
+
+Suggested bring-up order:
+
+1. Start with the defaults (6 channels). Check `/tmp/audioshim.log` for
+   `channels=6 master=0/1 hp=2/3 speakers=4/5` and
+   `format: S24_LE ... channels: 6` in
+   `/proc/asound/card1/pcm0p/sub0/hw_params`.
+2. Confirm master out on 0/1 and headphones on 2/3. If they are swapped, use
+   the offset override above.
+3. The speaker path (4/5) follows the physical speaker knob (CC17) and is
+   gated only by that knob. Use `SPEAKER_GAIN=1.0` while checking levels.
+
+**Format:** `audioshim.c` requests `SND_PCM_FORMAT_S24_LE`; measured on the
+Pro Plus: `S24_LE, 6 ch, 44100`, RUNNING. Engine uses `S32_LE, 6 ch` on the
+same card; both are valid. The S32_LE fallback is not required (keep it only
+as hardening).
+
+The JP21/SC Live 4 layout is still reachable with
+`AUDIO_CHANNELS=8 AUDIO_HP_OFFSET=4 AUDIO_SPEAKER_OFFSET=6`. The shim does not
+drive JP21's booth pair at 2/3.
+
+## JP21 channel map (SC Live 4)
 
 XLR main, built-in monitors, headphones (cue + master cue + split cue), booth,
 and all panel level knobs/switches are driven by `audioshim.so`.
-
-## JP21 channel map
 
 `aplay -D hw:1,0 -c 8 -f S32_LE`, one pair at a time:
 
@@ -18,7 +92,7 @@ The codec exposes **no ALSA mixer controls** (`amixer -c 1 scontrols` is empty)
 and the hardware format is **S24_LE** (`hw_params` confirms), so all routing and
 level is done in software in `audioshim.so`.
 
-## audioshim routing
+## audioshim routing (JP21)
 
 `scripts/shims/audioshim.c` opens `hw:1,0` with 8 channels (S24_LE, 44.1 kHz):
 

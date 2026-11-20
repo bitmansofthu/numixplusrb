@@ -6,7 +6,18 @@
 # Run after every reboot, before starting rbp.
 
 # --- bind mounts -----------------------------------------------------------
-umount /data/rbx3-run/dev 2>/dev/null
+# /data/rbx3-run/dev is a bind of the host /dev, i.e. the *same* devtmpfs.
+# Deleting files through it deletes the host's device nodes (no /dev/null,
+# no /dev/urandom -> sshd resets every connection until the next reboot).
+# So: unmount first and abort if the mount is still there.
+for m in dev proc sys tmp; do
+  mountpoint -q "/data/rbx3-run/$m" && umount "/data/rbx3-run/$m" 2>/dev/null
+  mountpoint -q "/data/rbx3-run/$m" && umount -l "/data/rbx3-run/$m" 2>/dev/null
+  if mountpoint -q "/data/rbx3-run/$m"; then
+    echo "fix-dev: /data/rbx3-run/$m is still mounted; refusing to touch it" >&2
+    exit 1
+  fi
+done
 rm -rf /data/rbx3-run/dev
 mkdir -p /data/rbx3-run/dev
 mount --bind /dev /data/rbx3-run/dev

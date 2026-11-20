@@ -5,8 +5,9 @@
  * left untouched — the fbdev driver presents the rotated image.
  *
  * PART 2 (touch): emulate the XDJ-RX3's custom tsc2007 touch device
- * (/dev/tsc2007_2-0048) by translating the ILI2117 evdev touchscreen
- * (/dev/input/event0):
+ * (/dev/tsc2007_2-0048) by translating the ILI2117 evdev touchscreen.
+ * The event node number is resolved at runtime (by-path link, then sysfs
+ * device name); it is not stable across boots — event0 is often gpio-keys.
  *   ioctl(fd, 0x80046b00, &x) -> return max X (=3)
  *   ioctl(fd, 0x40046b00, &x) -> accept
  *   ioctl(fd, 0x80026b01, &y) -> return max Y (=3900)
@@ -103,10 +104,19 @@ static int real_pipe2(int fds[2])
 
 /* ============ PART 2: tsc2007 emulation ============ */
 #define TSC_DEVICE  "/dev/tsc2007_2-0048"
-#define EVDEV_PATH  "/dev/input/event0"
 #define RAW_MAX     2048
 #define TSC_MAX_X   3
 #define TSC_MAX_Y   3900
+
+/* The touchscreen's event number is NOT stable across boots: the i2c touch
+ * controller and the platform gpio-keys driver probe in varying order, so
+ * event0 may be either one (seen on the Mixstream Pro Plus: event0 =
+ * gpio-keys, event1 = ILI2117).  Resolve by the stable by-path link, then by
+ * device name, and only then fall back to event0.  Override with
+ * FBSHIM_TOUCH_EVDEV=/dev/input/eventN. */
+#define EVDEV_BYPATH "/dev/input/by-path/platform-ff160000.i2c-event"
+#define EVDEV_FALLBACK "/dev/input/event0"
+static char evdev_path[128] = EVDEV_FALLBACK;
 
 struct input_event {
     struct { uint32_t sec, usec; } time;
@@ -130,8 +140,69 @@ static int  cur_flag = 0;
 static int  fake_pipe_rd[64];
 static int  fake_used[64];
 
+static int read_text(const char *path, char *buf, size_t n)
+{
+    int fd = real_open(path, O_RDONLY);
+    int r;
+    if (fd < 0)
+        return -1;
+    r = real_read(fd, buf, n - 1);
+    real_close(fd);
+    if (r <= 0)
+        return -1;
+    buf[r] = '\0';
+    if (r > 0 && buf[r - 1] == '\n')
+        buf[r - 1] = '\0';
+    return 0;
+}
+
+static void resolve_evdev(void)
+{
+    const char *e = getenv("FBSHIM_TOUCH_EVDEV");
+    char name[128], path[128];
+    int fd, i;
+
+    if (e && *e) {
+        snprintf(evdev_path, sizeof(evdev_path), "%s", e);
+        return;
+    }
+    /* Stable by-path link for the i2c touch controller (rk3288 i2c-4). */
+    fd = real_open(EVDEV_BYPATH, O_RDWR);
+    if (fd >= 0) {
+        real_close(fd);
+        snprintf(evdev_path, sizeof(evdev_path), "%s", EVDEV_BYPATH);
+        return;
+    }
+    /* Fall back to scanning sysfs for the panel name. */
+    for (i = 0; i < 32; i++) {
+        snprintf(path, sizeof(path),
+                 "/sys/class/input/event%d/device/name", i);
+        if (read_text(path, name, sizeof(name)) < 0)
+            continue;
+        if (strstr(name, "ILI2117") || strstr(name, "Touch") ||
+            strstr(name, "touch")) {
+            snprintf(evdev_path, sizeof(evdev_path),
+                     "/dev/input/event%d", i);
+            return;
+        }
+        if (getenv("FBSHIM_DEBUG"))
+            fprintf(stderr, "fbshim: skipping event%d (%s)\n", i, name);
+    }
+    snprintf(evdev_path, sizeof(evdev_path), "%s", EVDEV_FALLBACK);
+}
+
 #define MAX_GPIO_FDS 256
 static char is_gpio_fd[MAX_GPIO_FDS];
+
+/* The panel on the Mixstream Pro Plus is 180 degrees from the SC Live 4
+ * mounting, so the same physical tap must be mirrored in both axes when
+ * DFB_ROTATE is `right` (DirectFB rot=270).  The old `left` transform was
+ * tuned on the SC Live 4; keep it unchanged for that device. */
+static int touch_rot180(void)
+{
+    const char *r = getenv("DFB_ROTATE");
+    return r && (strcmp(r, "right") == 0 || strcmp(r, "270") == 0);
+}
 
 static void transform(int rx, int ry, int *lx, int *ly)
 {
@@ -152,6 +223,10 @@ static void transform(int rx, int ry, int *lx, int *ly)
     if (py < 0) py = 0; else if (py > 1279) py = 1279;
     *lx = py;
     *ly = px;
+    if (touch_rot180()) {
+        *lx = 1279 - *lx;
+        *ly = 799 - *ly;
+    }
 }
 
 static void push_touch(int flag, int x, int y)
@@ -163,6 +238,9 @@ static void push_touch(int flag, int x, int y)
     buf[3] = (unsigned char)((x >> 8) & 0xff);
     buf[4] = (unsigned char)(y & 0xff);
     buf[5] = (unsigned char)((y >> 8) & 0xff);
+    if (getenv("FBSHIM_DEBUG"))
+        fprintf(stderr, "fbshim: touch %s %d,%d\n",
+                flag ? "down" : "up", x, y);
     if (out_pipe[1] >= 0)
         (void)write(out_pipe[1], buf, 6);
 }
@@ -182,7 +260,8 @@ static void *reader_thread(void *arg)
             real_close(evfd);
             evfd = -1;
             while (evfd < 0) {
-                evfd = real_open(EVDEV_PATH, O_RDWR);
+                resolve_evdev();
+                evfd = real_open(evdev_path, O_RDWR);
                 if (evfd < 0)
                     usleep(500000);
             }
@@ -231,7 +310,10 @@ static void ensure_reader(void)
 {
     if (reader_started)
         return;
-    evfd = real_open(EVDEV_PATH, O_RDWR);
+    resolve_evdev();
+    if (getenv("FBSHIM_DEBUG"))
+        fprintf(stderr, "fbshim: touch evdev %s\n", evdev_path);
+    evfd = real_open(evdev_path, O_RDWR);
     if (evfd < 0)
         return;
     if (real_pipe2(out_pipe) < 0) {

@@ -21,6 +21,14 @@
  *   Mixer   (ch 0..3): pfl n13, trim CC3, treble CC4, mid CC6, bass CC8,
  *                    fader CC14, sweep fx knob CC11, Thru n15, VU CC10
  *
+ * Mixstream Pro Plus side (NH08S_Controller_Assignments.qml; same file as the
+ * NH08): Global ch15, decks ch 2/3, mixer ch 0/1, FX ch 4/5.  Differences that
+ * matter here: jog 0x37/0x4D at 1638 counts/rev, pitch fader NOT inverted
+ * (top = faster; JP21's SpeedSlider has `invert: true`), sweep knob CC11 is
+ * the only Sound Color FX control (Filter is selected by the shim), and the
+ * VU is a stereo main-level pair on ch15 CC32/CC33 with incremental
+ * ledCCValues [0,14,27,40,53,66] for its five LEDs.
+ *
  * RX3 side (keycodes decoded from rbp's allinone_debug button/knob tables,
  * shift-corrected and verified against the handlers in rbp itself):
  *   sendKey(keycode, op, ch, param, float f, long l)
@@ -59,7 +67,11 @@
  * Env:
  *   KNOB_SCALE=n    selector ticks per knob step (default 1)
  *   JOG_SCALE=n     jog ticks per 14-bit delta step (default 1)
- *   JOG_PPR=n       jog counts per full revolution (default 128)
+ *   JOG_PPR=n       hardware counts per full revolution (default 128;
+ *                   NH08S 1638) - used for the rev/s speed value
+ *   JOG_OUT_PPR=n   pulses per revolution sent to rbp (0 = same as JOG_PPR;
+ *                   NH08S 3600 = rbp's JogPulse/SAMPLE_PER_PULSE scale)
+ *   JOG_SPEED_GAIN=n  multiply the reported speed (default 1.0; NH08S 1.5)
  *   JOG_REV=1       reverse jog direction (default 0)
  *   JOG_IDLE_MS=n   ms of inactivity before a speed-0 jog key is sent
  *                   (default 120)
@@ -149,12 +161,16 @@ static int is_rbp_process(void)
 #define K_REKORDBOX  0x0208    /* RX3 REKORDBOX key */
 #define K_TAGLIST    0x0203
 #define K_MENU       0x0206
+#define K_SEARCH     0x0205    /* RX3 SEARCH key (keyCodeAsText "Search") */
+#define K_SHORTCUT   0x0210    /* RX3 SHORTCUT key (keyCodeAsText table) */
 #define K_INFO       0x020b
 #define K_BACK       0x420d    /* RX3 BACK key */
 #define K_LOAD       0x4311
 #define K_PLAY       0x4101
 #define K_CUE        0x4102
+#define K_SHIFT      0x4103    /* rbp's internal SHIFT (ui::KeyInput::getShiftKeyCode) */
 #define K_SYNC       0x4112
+#define K_DECKQUANT  0x410b    /* DeckQuantize: rbp toggles on OP_PRESS */
 #define K_VINYL      0x4104
 #define K_JOG_TOUCH  0x4306    /* jog plate touch  (push/release) */
 #define K_JOG_ROT    0x4305    /* jog wheel rotate: f=speed(rev/s) l=pos */
@@ -421,7 +437,18 @@ struct jog_ctrl {
 static struct jog_ctrl jog_state[2] = { {4,0,0,0,0,0,0,0,0,0.0f,1},
                                         {5,0,0,0,0,0,0,0,0,0.0f,2} };
 
-static int jog_ppr = 128;      /* Prime GO counts per revolution (calibrate) */
+static int jog_ppr = 128;      /* counts per revolution; product default is
+                                * applied in midi_thread() (NH08S = 1638) */
+static int jog_out_ppr = 0;    /* pulses per rev sent to rbp (0 = jog_ppr).
+                                * rbp's JogPulse converts 1 pulse to
+                                * SAMPLE_PER_PULSE_ = 12.25 samples at
+                                * 44.1 kHz, i.e. a 3600-pulse revolution is
+                                * exactly one second of audio at 1 rev/s.
+                                * Sending only 1638 pulses made scratches and
+                                * seeks run at ~45 % of the wheel speed. */
+static float jog_speed_gain = 1.0f;  /* scales the rev/s value handed to
+                                      * rbp; the power-on default is raised
+                                      * for NH08S in midi_thread() */
 static int jog_rev = 0;        /* invert jog direction */
 static int jog_idle_ms = 120;
 static int jog_verbose = 0;
@@ -437,6 +464,62 @@ struct pitch_ctrl {
 static struct pitch_ctrl pitch_state[2] = { {4,0,0,0,0}, {5,0,0,0,0} };
 static int tempo_verbose = 0;
 
+/* ---- product detection ---------------------------------------------------
+ * JP21 = SC Live 4: decks on MIDI ch 4/5, jog CC 0x11/0x31, bitmask VU.
+ * NH08/NH08S = Mixstream Pro (Plus): decks on ch 2/3, jog CC 0x37/0x4D,
+ * incremental VU.  start-rb.sh exports KNOBSHIM_PRODUCT; when the shim is
+ * loaded without it (manual run) fall back to the device tree. */
+static int g_nh08s = 0;
+static int g_deck_ch[2] = { 4, 5 };
+static int g_jog_hi = 0x11;
+static int g_jog_lo = 0x31;
+
+static int deck_of_ch(int ch)
+{
+     for (int i = 0; i < 2; i++)
+          if (g_deck_ch[i] == ch)
+               return i;
+     return -1;
+}
+
+static void read_product_file(const char *path, char *buf, size_t n)
+{
+     int fd = real_open(path, O_RDONLY);
+     ssize_t r;
+     if (fd < 0)
+          return;
+     r = real_read(fd, buf, n - 1);
+     real_close(fd);
+     if (r > 0)
+          buf[r] = '\0';
+}
+
+static void detect_product(void)
+{
+     char buf[256] = "";
+     const char *s = getenv("KNOBSHIM_PRODUCT");
+     if (s && *s) {
+          strncpy(buf, s, sizeof(buf) - 1);
+          buf[sizeof(buf) - 1] = '\0';
+     } else {
+          read_product_file("/proc/device-tree/inmusic,product-code",
+                            buf, sizeof(buf));
+          if (!buf[0])
+               read_product_file("/proc/device-tree/compatible",
+                                 buf, sizeof(buf));
+     }
+     g_nh08s = (strstr(buf, "NH08") || strstr(buf, "nh08") ||
+                strstr(buf, "Mixstream") || strstr(buf, "mixstream")) ? 1 : 0;
+     g_deck_ch[0] = g_nh08s ? 2 : 4;
+     g_deck_ch[1] = g_nh08s ? 3 : 5;
+     g_jog_hi = g_nh08s ? 0x37 : 0x11;
+     g_jog_lo = g_nh08s ? 0x4D : 0x31;
+     jog_state[0].rch = g_deck_ch[0];
+     jog_state[1].rch = g_deck_ch[1];
+     pitch_state[0].rch = g_deck_ch[0];
+     pitch_state[1].rch = g_deck_ch[1];
+}
+
 /* monotonic ms */
 static unsigned long long now_ms(void)
 {
@@ -449,6 +532,7 @@ static unsigned long long now_ms(void)
 /* browse knob position (global CC5) */
 static int knob_pos = -1;
 static int shift_down = 0;
+static int shift_dn[2] = { 0, 0 };
 
 /* TIME knob push (ch15 note 25) held: turning the TIME knob then acts as the
  * RX3's BEAT < / BEAT > buttons instead of changing the time. */
@@ -463,6 +547,11 @@ static int led_loop_armed[2];
  * SC Live 4 (Engine OS meters are post-fader). */
 static int g_fader[3] = { 1023, 1023, 1023 };
 static int g_fader_seen[3];      /* set once the panel has reported a fader */
+
+/* set once the panel has reported its Sweep FX knob (CC11).  Used on NH08S to
+ * stop seeding the Sound Color FX parameter at 50 % as soon as the real knob
+ * position is known, so a live turn is never overridden. */
+static int g_color_seen[3];
 
 /* SYNC hold -> MASTER (the SC Live 4 has no MASTER button).  rbp's
  * onKey_Sync only acts on release (op 2) and onKey_Master only on press
@@ -513,6 +602,22 @@ volatile int g_vu_peak[2] = { 0, 0 };
 static int source_menu_with_usb1(void)
 {
      if (*(volatile uint32_t *)0x326f8b8 != 12)   /* browseMode != 12 */
+          return 0;
+     if (access("/media/usb1/sda1/PIONEER/rekordbox/export.pdb", F_OK) != 0)
+          return 0;
+     return 1;
+}
+
+/* No source selected yet (browse device 0) while a rekordbox stick is
+ * mounted.  The XDJ-RX3 has a dedicated SOURCE button; the Mixstream does
+ * not, so here the browse-knob push opens the source menu and a second push
+ * selects USB1 (the remap above).  The source menu itself (browseMode 12) is
+ * excluded so its own push still means "select". */
+static int source_prompt_shown(void)
+{
+     if (*(volatile uint32_t *)0x326f8b8 == 12)   /* source menu already open */
+          return 0;
+     if (*(volatile uint32_t *)0x326f8bc != 0)    /* browse device already selected */
           return 0;
      if (access("/media/usb1/sda1/PIONEER/rekordbox/export.pdb", F_OK) != 0)
           return 0;
@@ -631,6 +736,157 @@ static int me_get_master_cue(void)
      return ((int (*)(void *))ME_GET_MASTER_CUE)(engine);
 }
 
+/* ---- quantize-off default for the NH08S -------------------------------
+ * The Mixstream has no QUANTIZE button, so rbp's deck quantize stays in
+ * whatever state its startup initialisation leaves behind (users reported it
+ * as ON).  djengine::DjEngineIF owns the play engine and its singleton
+ * pointer (0x011492d8) is created lazily, separately from MixerEngine:
+ *   isDeckQuantizing(ch) / setDeckQuantizing(ch, bool)    0x4aa88 / 0x4a9d0
+ *   isBeatEffectQuantizeOn() / setBeatEffectQuantizeOnOff(bool)
+ *                                                          0x4e1dc / 0x4e12c
+ * EnPlayerChannel is 0-based here: deck 1 = 0, deck 2 = 1 (see
+ * PlayerInnards::onKey_Quantize, which computes (deck == 2) ? 1 : 0). */
+#define DJ_ENGINE_SINGLETON 0x011492d8UL
+#define DJ_IS_DECK_QUANT    0x0004aa88UL
+#define DJ_SET_DECK_QUANT   0x0004a9d0UL
+#define DJ_IS_FX_QUANT      0x0004e1dcUL
+#define DJ_SET_FX_QUANT     0x0004e12cUL
+
+static void *dj_engine(void)
+{
+     return *(void **)DJ_ENGINE_SINGLETON;
+}
+
+/* Decks whose quantize the user explicitly enabled (SHIFT + pitch bend +).
+ * The 30 s startup enforcement must not switch those back off. */
+static volatile int g_quant_user_set[2];
+
+static void nh08s_quantize_off(void)
+{
+     static int deck_reported[2], fx_reported;
+     void *e = dj_engine();
+     if (!e)
+          return;
+     for (int d = 0; d < 2; d++) {
+          if (g_quant_user_set[d])
+               continue;
+          if (((int (*)(void *, int))DJ_IS_DECK_QUANT)(e, d)) {
+               ((void (*)(void *, int, int))DJ_SET_DECK_QUANT)(e, d, 0);
+               klog("knobshim2: deck %d quantize was ON -> OFF\n", d + 1);
+               deck_reported[d] = 0;
+          } else if (!deck_reported[d]) {
+               deck_reported[d] = 1;
+               klog("knobshim2: deck %d quantize is OFF\n", d + 1);
+          }
+     }
+     if (((int (*)(void *))DJ_IS_FX_QUANT)(e)) {
+          ((void (*)(void *, int))DJ_SET_FX_QUANT)(e, 0);
+          klog("knobshim2: Beat FX quantize was ON -> OFF\n");
+          fx_reported = 0;
+     } else if (!fx_reported) {
+          fx_reported = 1;
+          klog("knobshim2: Beat FX quantize is OFF\n");
+     }
+}
+
+/* The Mixstream has no Beat FX LEVEL/DEPTH knob, so the shim must supply the
+ * wet/dry value that rbp would otherwise read from the RX3's knob.  The knob
+ * is a no-effect position at 0, so without this the effect is switched on but
+ * stays fully dry (display shows FX ON, audio unchanged).  512/1023 = 50% is
+ * clearly audible without going 100% wet.  It is re-sent before every
+ * activation and during the startup enforcement because rbp's
+ * BeatEffectManager re-initialises its parameters when the type changes. */
+#define FX_DEPTH_10BIT 512
+static void set_fx_depth(void)
+{
+     send_rx_key_f(K_DEPTH, OP_VALUE, CH_GLOBAL, FX_DEPTH_10BIT, 0.5f);
+     if (verbose)
+          klog("knobshim2: Beat FX depth -> 50%% (%d)\n", FX_DEPTH_10BIT);
+}
+
+/* NH08S deck FX paddles are momentary, but the RX3's FX ON key is a toggle
+ * (the hardware button latches).  UiGetMixBeatFxOn() reads the ON bit from
+ * rbp's UI state (g_ui -> [0x38] -> StatWatcher, pure memory reads), so the
+ * shim can tell whether the effect is already on before toggling it. */
+#define ADDR_UI_MIX_BFX_ON 0x000fe46cUL
+static int bfx_is_on(void)
+{
+     return ((int (*)(void))ADDR_UI_MIX_BFX_ON)() != 0;
+}
+
+/* set by the FX-assign knob or a deck paddle: stops the startup thread that
+ * forces the Beat FX channel back to MASTER. */
+static volatile int g_bfxch_user_set;
+
+/* per-deck paddle state: held, and whether the effect was already on when the
+ * paddle went down (if it was, the release must not switch it off). */
+static int fx_paddle_down[2];
+static int fx_paddle_was_on[2];
+
+/* ---- NH08S pad layer ------------------------------------------------------
+ * The Mixstream Pro Plus has only FOUR performance pads per deck, but rbp's
+ * pad handlers understand eight (K_PAD1..K_PAD8 = 0x4117..0x411e).  The QML
+ * assigns the physical pads to notes 15..18, so pads 5..8 are reached with
+ * SHIFT held:
+ *   - AUTO LOOP / SLIP LOOP / BEAT JUMP: pad 1..4 + SHIFT -> K_PAD5..8
+ *     (rbp's own second page: shorter loop sizes, the other beat jumps).
+ *   - HOT CUE: pad 1..4 + SHIFT -> delete that hot cue.  rbp has no separate
+ *     "delete" keycode: IKeyManager::sendKey() calls getShiftKeyCode()
+ *     (0x4103) and isPressed(0x4103, ch 1/2), appending the deck channel to
+ *     IKeyInput's parameter vector.  pad_HotCue() scans that vector for its
+ *     own channel and takes the clearHotCue() branch when it is present.
+ *     The shim therefore sends 0x4103 press/release on the deck channel when
+ *     NH08S Shift (note 28) is held, in addition to MENU/SHORTCUT globally.
+ * The current pad mode is rbp's own PlayerInnards::[+0x74] (0 = HOT CUE,
+ * 1 = AUTO/LOOP, 2 = SLIP LOOP, 3 = BEAT JUMP) - see onKey_HotCue(),
+ * onKey_AutoBeatLoop(), onKey_SlipBeatLoop(), onKey_BeatJumpLoopMove().
+ *
+ * Neither PlayerInnards nor the UI manager's player array is reliably
+ * reachable from the shim (IUiObjManager::getPlayer()'s array is empty in
+ * this build), so the mode comes from rbp's ui::StatWatcher:
+ *   ui::StatWatcher::getPadMode(ENUM_DECK)  @0x2c0464
+ *   = *(stat + (deck == 0 ? 0xc : 0x10)) -> byte +0x281
+ * and PlayerInnards::getStat() writes that byte from its own [+0x7c..+0x79].
+ * That encoding is base mode plus an extended flag, so the byte can be 4..7:
+ *   +0x7c -> 7 (BEAT JUMP), +0x7b -> 6 (SLIP LOOP),
+ *   +0x7a -> 5 (AUTO LOOP), +0x79 -> 4 (HOT CUE), else 0..3.
+ * nh08s_pad_mode() masks with &3 so callers always get the base mode 0..3.
+ *
+ * StatWatcher itself is *(g_ui + 0x38) where g_ui = *(0x02685f2c)
+ * (same chain as IUiObjManager::getStatWatcher and the Beat FX reader).
+ * NOTE: *(StatWatcher + 0x1c) is the MixBeatFx sub-struct (byte +0xa =
+ * selector position), NOT the StatWatcher - do not dereference it here. */
+#define NH08S_STAT_DECK0_OFF  0x0c
+#define NH08S_STAT_DECK1_OFF  0x10
+#define NH08S_STAT_PADMODE    0x281
+
+static void *nh08s_statwatcher(void)
+{
+     void **ui = (void **)UI_OBJ_MGR_GLOBAL;
+     void *o;
+     if (!ui || !*ui)
+          return NULL;
+     o = *ui;
+     return *(void **)((char *)o + 0x38);
+}
+
+/* rbp's current pad mode for a deck, or -1 while rbp is still starting. */
+static int nh08s_pad_mode(int deck)
+{
+     void *w = nh08s_statwatcher();
+     void *d;
+     if (!w)
+          return -1;
+     d = *(void **)((char *)w + (deck == 0 ? NH08S_STAT_DECK0_OFF
+                                           : NH08S_STAT_DECK1_OFF));
+     if (!d)
+          return -1;
+     /* PlayerInnards::getStat() writes base mode + 4 when an extended pad
+      * flag is set (+0x79..+0x7c), so 4..7 mean HOT CUE/AUTO LOOP/SLIP LOOP/
+      * BEAT JUMP respectively.  Mask off that flag for pad routing/LEDs. */
+     return (int)(*(unsigned char *)((char *)d + NH08S_STAT_PADMODE) & 3);
+}
+
 static void handle_note(int ch, int note, int on)
 {
      /* SC Live 4 mixer PFL buttons (strips 1/2 = ch 0/1, note 13): toggle
@@ -649,7 +905,7 @@ static void handle_note(int ch, int note, int on)
 
      /* SC Live 4 built-in monitor on/off switch (ch15 note 41): gates the
       * ch6/7 speaker output only (rbp/booth/monitors unaffected). */
-     if (ch == 15 && note == 41) {
+     if (!g_nh08s && ch == 15 && note == 41) {
           g_speaker_on = on ? 1 : 0;
           klog("knobshim2: speaker switch note41 velocity-on=%d -> speakers %s\n",
                on, g_speaker_on ? "ON" : "OFF");
@@ -657,8 +913,9 @@ static void handle_note(int ch, int note, int on)
      }
 
      /* SC Live 4 has no MASTER CUE button: strips 3/4 PFL (ch 2/3 note 13)
-      * toggle rbp's master cue. */
-     if ((ch == 2 || ch == 3) && note == 13) {
+      * toggle rbp's master cue.  On the Mixstream ch2/3 ARE the decks and
+      * note 13 is the fourth pad-mode button, so this must not run there. */
+     if (!g_nh08s && (ch == 2 || ch == 3) && note == 13) {
           if (on) {
                int cur = me_get_master_cue();
                int want = (cur == 0) ? 1 : 0;
@@ -679,14 +936,113 @@ static void handle_note(int ch, int note, int on)
           return;
      }
 
-     if ((ch == 4 || ch == 5) && note == 28)
-          shift_down = on;
+     if (g_nh08s) {
+          /* Mixstream FX select buttons: ch4 notes 0..3 (printed
+           * Echo / Flanger / Delay / Phaser).  rbp takes the RX3 selector
+           * POSITION and maps it to a type itself.  Verified from rbp's
+           * BeatEffectManager::storeMaxMinValue jump table
+           * (EnBeatEffectType): 1 Reverb, 2 Trans, 3 Roll, 4 Flanger,
+           * 5 Echo, 6 Delay, 7 Spiral, 8 Pitch, 9 Phaser, 10 Filter,
+           * 11 VinylBrake, 12 SlipRoll, 13 PingPong, 14 Helix; combined
+           * with the position table 0->6 1->5 2->13 3->7 4->14 5->1
+           * 6->4 7->9 8->10 9->2 10->3 11->12 12->8 13->11 this gives
+           * Echo = pos1, Flanger = pos6, Delay = pos0, Trans = pos9.
+           * The 4th button drives TRANS. */
+          static const int fx_pos[4] = { 1, 6, 0, 9 };
+          if (ch == 4 && note >= 0 && note <= 3) {
+               if (on) {
+                    /* SHIFT + ECHO / SHIFT + FLANGER are the RX3's BEAT < /
+                     * BEAT > keys (halve / double the Beat FX beat fraction).
+                     * rbp's asEventCode only emits these for OP_PRESS and the
+                     * long argument carries the direction (-1 / +1).
+                     * SHIFT + DELAY / SHIFT + PHASER assign the Beat FX to
+                     * channel 1 (PLAYER_0) / channel 2 (PLAYER_1), replacing
+                     * the paddle's old implicit channel change. */
+                    if (shift_down && (note == 0 || note == 1)) {
+                         int dir = (note == 0) ? -1 : 1;
+                         int key = (dir < 0) ? K_BEATPREV : K_BEATNEXT;
+                         send_rx_key_fl(key, OP_PRESS, CH_GLOBAL, dir, 0.0f, dir);
+                         klog("knobshim2: shift+fx note%d -> %s\n", note,
+                              (dir < 0) ? "BEAT<" : "BEAT>");
+                    } else if (shift_down) {
+                         int chn = note - 2;   /* DELAY -> 0, PHASER -> 1 */
+                         g_bfxch_user_set = 1;
+                         send_rx_key(K_BFXCH, OP_VALUE, CH_GLOBAL, chn);
+                         klog("knobshim2: shift+fx note%d -> BFXCH %d (channel %d)\n",
+                              note, chn, chn + 1);
+                    } else {
+                         send_rx_key(K_BFXTYPE, OP_VALUE, CH_GLOBAL, fx_pos[note]);
+                         klog("knobshim2: fx select note%d -> position %d\n",
+                              note, fx_pos[note]);
+                    }
+               }
+               return;
+          }
+          /* Deck FX paddle (ch4 = deck 1, ch5 = deck 2): momentary Beat FX.
+           * The paddle must NOT change the Beat FX channel any more; it only
+           * switches the currently selected effect on while held (and off
+           * again on release, unless it was already on before the press).
+           * The wet/dry level is still seeded because the Mixstream has no
+           * DEPTH knob. */
+          if ((ch == 4 || ch == 5) && note == 4) {
+               int d = ch - 4;                   /* 0 = deck 1, 1 = deck 2 */
+               if (on && !fx_paddle_down[d]) {
+                    fx_paddle_down[d] = 1;
+                    set_fx_depth();
+                    fx_paddle_was_on[d] = bfx_is_on();
+                    if (!fx_paddle_was_on[d]) {
+                         send_rx_key(K_BFX, OP_PRESS, CH_GLOBAL, 0);
+                         send_rx_key(K_BFX, OP_RELEASE, CH_GLOBAL, 0);
+                    }
+                    klog("knobshim2: deck %d FX paddle down -> fx %s (channel "
+                         "unchanged)\n", d + 1,
+                         fx_paddle_was_on[d] ? "already on" : "ON");
+               } else if (!on && fx_paddle_down[d]) {
+                    fx_paddle_down[d] = 0;
+                    int still_on = bfx_is_on();
+                    if (!fx_paddle_was_on[d]) {
+                         send_rx_key(K_BFX, OP_PRESS, CH_GLOBAL, 0);
+                         send_rx_key(K_BFX, OP_RELEASE, CH_GLOBAL, 0);
+                    }
+                    klog("knobshim2: deck %d FX paddle up -> fx %s (rbp state=%d)\n",
+                         d + 1, fx_paddle_was_on[d] ? "left on" : "OFF", still_on);
+               }
+               return;
+          }
+     }
+
+     /* NH08S SETTINGS / MENU (global note 7): plain press opens rbp's MENU;
+      * SHIFT + press sends rbp's SHORTCUT key (0x0210, the RX3 SHORTCUT
+      * button).  shift_down is maintained from the per-deck Shift note 28. */
+     if (g_nh08s && ch == 15 && note == 7) {
+          int key = shift_down ? K_SHORTCUT : K_MENU;
+          send_rx_key(key, on ? OP_PRESS : OP_RELEASE, CH_GLOBAL, 0);
+          if (verbose)
+               klog("knobshim2: Settings note7 %s -> 0x%04x (%s)\n",
+                    on ? "on" : "off", key,
+                    shift_down ? "shortcut" : "menu");
+          return;
+     }
+
+     if (deck_of_ch(ch) >= 0 && note == 28) {
+          int d = deck_of_ch(ch);
+          shift_dn[d] = on;
+          shift_down = shift_dn[0] || shift_dn[1];
+          /* rbp's internal SHIFT is 0x4103 (KeyInput::getShiftKeyCode).
+           * sendKey() checks isPressed(0x4103, deck channel) and appends the
+           * channel to the key parameter vector; pad_HotCue() needs that to
+           * select clearHotCue() instead of play/record. */
+          send_rx_key(K_SHIFT, on ? OP_PRESS : OP_RELEASE, d + 1, 0);
+          if (verbose)
+               klog("knobshim2: deck%d shift -> 0x4103 %s\n", d + 1,
+                    on ? "press" : "release");
+     }
      if (ch == 15 && note == 25)
           fx_time_btn = on;
 
      /* SC Live 4 global Sound Color FX select (ch15 notes 21..24) -> both mixer
-      * channels (Filter/DubEcho/Noise/Sweep). */
-     if (ch == 15 && note >= 21 && note <= 24) {
+      * channels (Filter/DubEcho/Noise/Sweep).  JP21-only. */
+     if (!g_nh08s && ch == 15 && note >= 21 && note <= 24) {
           int fxkey = 0;
           switch (note) {
           case 21: fxkey = K_FILTER;  break;  /* DualFilter */
@@ -706,12 +1062,31 @@ static void handle_note(int ch, int note, int on)
 
      /* Source menu + mounted Rekordbox stick: knob push and FWD become the
       * USB1 source button.  Swallow BOTH edges so the generic SELECTOR/SOURCE
-      * mapping below never fires for this gesture. */
+      * mapping below never fires for this gesture.
+      *
+      * "Please select a source" (browseMode 3, no device): the same push
+      * opens the SOURCE menu instead, which the RX3 normally does with its
+      * hardware SOURCE key (the Mixstream has none).  One key pair is sent on
+      * the press; the release is swallowed so an async mode change cannot
+      * turn it into a second event. */
      if (ch == 15 && (note == 4 || note == 6)) {
           if (source_menu_with_usb1()) {
-               send_rx_key(K_USB1, on ? OP_PRESS : OP_RELEASE, CH_GLOBAL, 0);
+               if (on) {
+                    send_rx_key(K_USB1, OP_PRESS, CH_GLOBAL, 0);
+                    send_rx_key(K_USB1, OP_RELEASE, CH_GLOBAL, 0);
+               }
                if (verbose)
                     klog("knobshim2: ch15 note%d %s -> USB1 select 0x0209\n",
+                         note, on ? "on" : "off");
+               return;
+          }
+          if (source_prompt_shown()) {
+               if (on) {
+                    send_rx_key(K_SOURCE, OP_PRESS, CH_GLOBAL, 0);
+                    send_rx_key(K_SOURCE, OP_RELEASE, CH_GLOBAL, 0);
+               }
+               if (verbose)
+                    klog("knobshim2: ch15 note%d %s -> open SOURCE menu 0x0201\n",
                          note, on ? "on" : "off");
                return;
           }
@@ -726,20 +1101,134 @@ static void handle_note(int ch, int note, int on)
       * loaded the other deck's track.  Deciding on release is free because
       * rbp's onKey_Sync only acts on release (op 2) and onKey_Master only on
       * press (op 0). */
-     if ((ch == 4 || ch == 5) && note == 8) {
-          int d = ch - 4;
+     if (deck_of_ch(ch) >= 0 && note == 8) {
+          int d = deck_of_ch(ch);
+          /* SHIFT + SYNC toggles the deck's sync master: rbp's onKey_Master
+           * (0x4111) maps to DjEngineIF::setSyncMaster and acts only on
+           * OP_PRESS, so it is sent as a one-shot press/release.  The sync
+           * release is swallowed (sync_shift latch) and the hold-to-master
+           * timer is disarmed so it cannot send a second MASTER. */
+          static int sync_shift[2];
           if (on) {
-               sync_press_ms[d] = now_ms();
-               sync_hold_fired[d] = 0;
-               sync_held[d] = 1;
+               if (g_nh08s && shift_down) {
+                    sync_held[d] = 0;
+                    if (!sync_shift[d]) {
+                         sync_shift[d] = 1;
+                         sync_hold_fired[d] = 1;
+                         send_rx_key(K_MASTER, OP_PRESS, d + 1, 0);
+                         send_rx_key(K_MASTER, OP_RELEASE, d + 1, 0);
+                         klog("knobshim2: deck %d shift+SYNC -> MASTER 0x4111\n",
+                              d + 1);
+                    }
+               } else {
+                    sync_shift[d] = 0;
+                    sync_press_ms[d] = now_ms();
+                    sync_hold_fired[d] = 0;
+                    sync_held[d] = 1;
+               }
           } else {
                sync_held[d] = 0;
-               /* if the hold already fired MASTER, the release does nothing;
-                * otherwise this was a tap -> SYNC */
-               if (!sync_hold_fired[d]) {
+               if (sync_shift[d]) {
+                    sync_shift[d] = 0;   /* MASTER already toggled on press */
+               } else if (!sync_hold_fired[d]) {
                     send_rx_key(K_SYNC, OP_PRESS, d + 1, 0);
                     send_rx_key(K_SYNC, OP_RELEASE, d + 1, 0);
                }
+          }
+          return;
+     }
+
+     /* NH08S pitch-bend − / + (deck notes 29 / 30) have no rbp equivalent;
+      * repurpose them as the RX3's deck TEMPO RANGE / MASTER TEMPO keys.
+      * Only the press is forwarded (rbp ignores every op but OP_PRESS for
+      * these keys), and a per-button edge latch keeps a held/repeated note-on
+      * from toggling master tempo more than once.  The release is swallowed
+      * so it cannot produce a second toggle. */
+     if (g_nh08s && deck_of_ch(ch) >= 0 && (note == 29 || note == 30)) {
+          static int bend_down[2][2];
+          int d = deck_of_ch(ch);
+          int idx = (note == 30) ? 1 : 0;
+          if (on && !bend_down[d][idx]) {
+               int key;
+               bend_down[d][idx] = 1;
+               if (idx && shift_down) {
+                    /* SHIFT + pitch bend + toggles THAT deck's quantize.
+                     * rbp's onKey_Quantize (0x410b) toggles on OP_PRESS and
+                     * takes the deck from the send channel, so note 30 on
+                     * ch2 toggles deck 1 and note 30 on ch3 toggles deck 2 -
+                     * the two decks stay independent.  The deck is marked
+                     * user-set so the 30 s startup sweep stops fighting it
+                     * whether it was just switched on or off. */
+                    void *e = dj_engine();
+                    int q = e ? ((int (*)(void *, int))DJ_IS_DECK_QUANT)(e, d) : -1;
+                    g_quant_user_set[d] = 1;
+                    send_rx_key(K_DECKQUANT, OP_PRESS, d + 1, 0);
+                    send_rx_key(K_DECKQUANT, OP_RELEASE, d + 1, 0);
+                    klog("knobshim2: deck %d shift+pitch bend + -> quantize %s\n",
+                         d + 1, q < 0 ? "toggle" : (q ? "OFF" : "ON"));
+               } else {
+                    key = idx ? K_MT : K_TEMPO_RANGE;
+                    send_rx_key(key, OP_PRESS, d + 1, 0);
+                    send_rx_key(key, OP_RELEASE, d + 1, 0);
+                    klog("knobshim2: deck %d pitch bend %c -> 0x%04x (%s)\n",
+                         d + 1, idx ? '+' : '-', key,
+                         idx ? "master tempo" : "tempo range");
+               }
+          } else if (!on) {
+               bend_down[d][idx] = 0;
+          }
+          return;
+     }
+
+     /* SHIFT + VIEW -> rbp's SEARCH key (0x0205).  The press edge is latched
+      * so the correct release is sent even when SHIFT is let go first, and a
+      * plain VIEW press still reaches the K_BROWSE mapping below. */
+     if (g_nh08s && ch == 15 && note == 16) {
+          static int view_shift;
+          if (on && shift_down) {
+               if (!view_shift) {
+                    view_shift = 1;
+                    send_rx_key(K_SEARCH, OP_PRESS, CH_GLOBAL, 0);
+                    klog("knobshim2: shift+VIEW -> SEARCH 0x0205\n");
+               }
+               return;
+          }
+          if (view_shift) {
+               view_shift = 0;
+               send_rx_key(K_SEARCH, OP_RELEASE, CH_GLOBAL, 0);
+               return;
+          }
+     }
+
+     /* NH08S physical performance pads (notes 15..18).  There are only four
+      * per deck, so SHIFT selects rbp's pads 5..8.  In HOT CUE mode the pad
+      * keycode is unchanged; the per-deck 0x4103 SHIFT key sent by note 28
+      * makes rbp's sendKey() append the deck channel to the key parameters,
+      * which pad_HotCue() interprets as "delete this hot cue".  The mode is
+      * read live from rbp, so the same physical pad means the right thing
+      * after every pad-mode change. */
+     if (g_nh08s && deck_of_ch(ch) >= 0 && note >= 15 && note <= 18) {
+          static int pad_down[2][4], pad_key[2][4];
+          int d = deck_of_ch(ch);
+          int idx = note - 15;
+          int key;
+          if (on && !pad_down[d][idx]) {
+               int mode = nh08s_pad_mode(d);
+               key = K_PAD1 + idx;
+               if (shift_dn[d] && mode >= 1 && mode <= 3)
+                    key = K_PAD1 + 4 + idx;              /* pads 5..8 */
+               pad_down[d][idx] = 1;
+               pad_key[d][idx] = key;
+               send_rx_key(key, OP_PRESS, d + 1, 0);
+               if (verbose || shift_dn[d])
+                    klog("knobshim2: deck%d pad%d -> 0x%05x press "
+                         "(mode=%d shift=%d)\n",
+                         d + 1, idx + 1, key, mode, shift_dn[d]);
+          } else if (!on && pad_down[d][idx]) {
+               pad_down[d][idx] = 0;
+               key = pad_key[d][idx] ? pad_key[d][idx] : (K_PAD1 + idx);
+               pad_key[d][idx] = 0;
+               send_rx_key(key, OP_RELEASE, d + 1, 0);
           }
           return;
      }
@@ -753,13 +1242,14 @@ static void handle_note(int ch, int note, int on)
                }
                int key = note_map[i].key;
                int *p = &note_map[i].pressed;
+               int d = deck_of_ch(ch);
                if (on && !*p) {
                     *p = 1;
-                    if (ch == 4 || ch == 5) {
+                    if (d >= 0) {
                          if (key == K_LOOPIN)
-                              led_loop_armed[ch - 4] = 1;
+                              led_loop_armed[d] = 1;
                          else if (key == K_LOOPOUT)
-                              led_loop_armed[ch - 4] = 0;
+                              led_loop_armed[d] = 0;
                     }
                     send_rx_key(key, OP_PRESS, note_map[i].sch, 0);
                     if (verbose || key == K_FILTER || key == K_SWEEP ||
@@ -797,6 +1287,9 @@ static void handle_cc_abs(int ch, int cc, int val)
                          g_fader[abs_map[i].sch] = v;
                          g_fader_seen[abs_map[i].sch] = 1;
                     }
+                    if (abs_map[i].key == K_COLOR && abs_map[i].sch >= 1 &&
+                        abs_map[i].sch <= 2)
+                         g_color_seen[abs_map[i].sch] = 1;
                     float fval = (float)v / 1023.0f;
                     if (abs_map[i].key == K_HPMIX)
                          g_cue_mix = fval;
@@ -844,10 +1337,10 @@ static void handle_jog(int ch, int cc, int val)
      if (idx < 0)
           return;
      struct jog_ctrl *s = &jog_state[idx];
-     if (cc == 0x11) {
+     if (cc == g_jog_hi) {
           s->have_hi = 1;
           s->pos = (s->pos & 0x7f) | (val << 7);   /* store hi half now */
-     } else if (cc == 0x31) {
+     } else if (cc == g_jog_lo) {
           s->have_lo = 1;
           s->pos = (s->pos & 0x3f80) | val;        /* store lo half now */
      } else {
@@ -877,21 +1370,33 @@ static void handle_jog(int ch, int cc, int val)
      if (dt < 0.0005f) dt = 0.0005f;
      if (jog_rev)
           d = -d;
-     int dp = d * jog_scale;               /* scaled pulse delta */
+     int dp = d * jog_scale;               /* scaled hardware count delta */
      if (dp > 4096) dp = 4096;
      if (dp < -4096) dp = -4096;
+     /* Position pulses handed to rbp: JogPulse treats one pulse as 12.25
+      * samples, so a full revolution must be 3600 pulses for the scratch /
+      * seek to move a second of audio per turn.  Keep each delta below
+      * JogPulse's 6480 "counter wrapped" threshold. */
+     long out_pulses = dp;
+     if (jog_out_ppr > 0 && jog_out_ppr != jog_ppr) {
+          out_pulses = (long)(((long long)dp * (long long)jog_out_ppr) /
+                              (long long)jog_ppr);
+          if (out_pulses > 6000) out_pulses = 6000;
+          if (out_pulses < -6000) out_pulses = -6000;
+     }
      /* continuous virtual counter in 16-bit space (wrap 65536) */
-     s->vpos = (unsigned int)(s->vpos + (unsigned int)dp) & 0xFFFFu;
-     /* speed in rev/s of the Prime GO jog */
+     s->vpos = (unsigned int)(s->vpos + (unsigned int)out_pulses) & 0xFFFFu;
+     /* speed in rev/s of the jog */
      float speed = (float)dp / (float)(jog_ppr * jog_scale) / dt;
+     speed *= jog_speed_gain;
      if (speed > 8.0f) speed = 8.0f;
      if (speed < -8.0f) speed = -8.0f;
      s->moving = 1;
      s->speed = speed;
      send_rx_key_fl(K_JOG_ROT, OP_ROTATE, s->sch, 0, speed, (long)s->vpos);
      if (jog_verbose)
-          klog("knobshim2: jog ch%d delta=%d speed=%.2f pos=%u (sch%d)\n",
-               ch, d, (double)speed, s->vpos, s->sch);
+          klog("knobshim2: jog ch%d delta=%d pulses=%ld speed=%.2f pos=%u (sch%d)\n",
+               ch, d, out_pulses, (double)speed, s->vpos, s->sch);
 }
 
 /* jog idle watcher: when the wheel has not moved for jog_idle_ms, send a
@@ -964,8 +1469,14 @@ static void handle_pitch(int ch, int cc, int val)
       * physical bottom (faster): pos = 0x0000 (0)
       * Pioneer:
       * float: -1.0 at top (slower), 0.0 at center, +1.0 at bottom (faster)
-      */
+      *
+      * The Mixstream's fader is wired the other way round: the NH08S QML
+      * SpeedSlider has no `invert: true` (the JP21 one does), so on NH08S
+      * the top of the fader is faster.  Flip the normalised value there;
+      * TEMPO_REV still acts as an explicit override on top of that. */
      float norm = ((float)0x2000 - (float)pos) / 8192.0f;
+     if (g_nh08s)
+          norm = -norm;
      if (norm > 1.0f) norm = 1.0f;
      if (norm < -1.0f) norm = -1.0f;
      if (tempo_rev)
@@ -1009,7 +1520,6 @@ static const signed char bfx_type_to_pos[15] = {
 };
 
 static int g_fx_type_pos = -1;         /* current SW_BFX_TYPE position */
-static volatile int g_bfxch_user_set;  /* user moved the assign knob */
 
 static void handle_fx_assign(int vel)
 {
@@ -1303,27 +1813,28 @@ static void handle_event(const struct snd_seq_event *ev)
           int ch = ev->data.control.channel;
           int cc = ev->data.control.param;
           int val = ev->data.control.value;
-          if (ch == 15 && cc == 15) {
+          int d = deck_of_ch(ch);
+          if (ch == 15 && cc == (g_nh08s ? 17 : 15)) {
                g_speaker_gain = (float)val / 127.0f;
                if (verbose)
-                    klog("knobshim2: speaker knob cc15=%d -> gain %.3f\n",
-                         val, (double)g_speaker_gain);
+                    klog("knobshim2: speaker knob cc%d=%d -> gain %.3f\n",
+                         cc, val, (double)g_speaker_gain);
           }
-          else if (ch == 15 && cc == 20) {
+          else if (ch == 15 && cc == (g_nh08s ? 15 : 20)) {
                g_master_gain = (float)val / 127.0f;
                if (verbose)
-                    klog("knobshim2: master knob cc20=%d -> gain %.3f\n",
-                         val, (double)g_master_gain);
+                    klog("knobshim2: master knob cc%d=%d -> gain %.3f\n",
+                         cc, val, (double)g_master_gain);
           }
           else if (ch == 15 && cc == 5)
                handle_knob_pos(val);
-          else if (ch == 15 && cc == 35)
+          else if (!g_nh08s && ch == 15 && cc == 35)
                handle_fx_select(val);
-          else if (ch == 15 && cc == 36)
+          else if (!g_nh08s && ch == 15 && cc == 36)
                handle_fx_time(val);
-          else if ((ch == 4 || ch == 5) && cc == 32)
-               handle_aloop(ch - 4, val);      /* beat-loop knob */
-          else if (cc == 0x11 || cc == 0x31)
+          else if (d >= 0 && cc == 32 && !g_nh08s)
+               handle_aloop(d, val);           /* JP21 beat-loop knob */
+          else if (cc == g_jog_hi || cc == g_jog_lo)
                handle_jog(ch, cc, val);
           else if (cc == 0x1F || cc == 0x4B)
                handle_pitch(ch, cc, val);
@@ -1334,17 +1845,21 @@ static void handle_event(const struct snd_seq_event *ev)
      case SNDRV_SEQ_EVENT_NOTEON: {
           int on = ev->data.note.velocity > 0;
           /* FX channel assign carries its position in the velocity */
-          if (ev->data.note.channel == 15 && ev->data.note.note == 40) {
+          if (!g_nh08s && ev->data.note.channel == 15 &&
+              ev->data.note.note == 40) {
                if (on)
                     handle_fx_assign(ev->data.note.velocity);
                break;
           }
-          /* beat-loop knob push: engage a loop of the selected length */
-          if ((ev->data.note.channel == 4 || ev->data.note.channel == 5) &&
-              ev->data.note.note == 39) {
-               if (on)
-                    handle_aloop_button(ev->data.note.channel - 4);
-               break;
+          /* JP21 beat-loop knob push: engage a loop of the selected length.
+           * (NH08S has no such control; its pads are mapped directly.) */
+          {
+               int d = deck_of_ch(ev->data.note.channel);
+               if (!g_nh08s && d >= 0 && ev->data.note.note == 39) {
+                    if (on)
+                         handle_aloop_button(d);
+                    break;
+               }
           }
           handle_note(ev->data.note.channel, ev->data.note.note, on);
           break;
@@ -1363,6 +1878,8 @@ static void *bfx_init_thread(void *arg)
      for (int i = 0; i < 6 && !g_bfxch_user_set; i++) {
           usleep(500000); /* 500ms */
           send_rx_key(K_BFXCH, OP_VALUE, CH_GLOBAL, BFX_CH_MASTER);
+          if (g_nh08s)
+               set_fx_depth();
      }
      klog("knobshim2: Beat FX Channel master enforcement complete\n");
      return NULL;
@@ -1370,26 +1887,71 @@ static void *bfx_init_thread(void *arg)
 
 static void build_maps(void)
 {
-     /* ---- global (ch 15) — send ch 1 ---- */
-     /* LOAD streams on the GLOBAL channel (verified live: deck 1 LOAD =
-      * ch15 note1; Prime GO is the same).  It is NOT on the deck channel. */
-     add_note(15, 1, K_LOAD, 1);               /* deck 1 LOAD */
-     add_note(15, 2, K_LOAD, 2);               /* deck 2 LOAD */
-     add_note(15, 3,  K_BACK, CH_GLOBAL);      /* BACK */
-     add_note(15, 4,  K_SOURCE, CH_GLOBAL);    /* FWD -> source */
-     add_note(15, 6,  K_SELECTOR, CH_GLOBAL);  /* browse knob push */
-     add_note(15, 13, K_MENU, CH_GLOBAL);      /* MENU */
-     add_note(15, 14, K_BROWSE, CH_GLOBAL);    /* VIEW */
-     add_abs(15, 14, K_XFADER, CH_GLOBAL);     /* crossfader */
-     add_abs(15, 18, K_HPMIX, CH_GLOBAL);      /* cue mix */
-     add_abs(15, 19, K_HPLEVEL, CH_GLOBAL);    /* cue gain */
-     /* CC20 (Main Vol) is handled in the CC dispatch as g_master_gain (ch0/1
-      * only) - NOT sent to rbp's master level, which would affect everything. */
+     if (!g_nh08s) {
+          /* ---- JP21/SC Live 4 global (ch 15) — send ch 1 ---- */
+          /* LOAD streams on the GLOBAL channel (verified live: deck 1 LOAD =
+           * ch15 note1; Prime GO is the same).  It is NOT on the deck channel. */
+          add_note(15, 1, K_LOAD, 1);               /* deck 1 LOAD */
+          add_note(15, 2, K_LOAD, 2);               /* deck 2 LOAD */
+          add_note(15, 3,  K_BACK, CH_GLOBAL);      /* BACK */
+          add_note(15, 4,  K_SOURCE, CH_GLOBAL);    /* FWD -> source */
+          add_note(15, 6,  K_SELECTOR, CH_GLOBAL);  /* browse knob push */
+          add_note(15, 13, K_MENU, CH_GLOBAL);      /* MENU */
+          add_note(15, 14, K_BROWSE, CH_GLOBAL);    /* VIEW */
+          add_abs(15, 14, K_XFADER, CH_GLOBAL);     /* crossfader */
+          add_abs(15, 18, K_HPMIX, CH_GLOBAL);      /* cue mix */
+          add_abs(15, 19, K_HPLEVEL, CH_GLOBAL);    /* cue gain */
+          /* CC15 speaker / CC20 master in the CC dispatch. */
+     } else {
+          /* ---- NH08S/Mixstream Pro Plus global (ch 15) ---- */
+          /* LOAD 1/2 and BACK arrive on the GLOBAL channel (verified with
+           * aseqdump: physical presses = ch15 note1/2/3), even though the
+           * QML declares Load inside the per-deck block. */
+          add_note(15, 1, K_LOAD, 1);               /* LOAD deck 1 */
+          add_note(15, 2, K_LOAD, 2);               /* LOAD deck 2 */
+          add_note(15, 3, K_BACK, CH_GLOBAL);       /* BACK */
+          add_note(15, 6,  K_SELECTOR, CH_GLOBAL);  /* Browse push */
+          add_note(15, 7,  K_MENU, CH_GLOBAL);      /* MENU */
+          add_note(15, 16, K_BROWSE, CH_GLOBAL);    /* VIEW */
+          /* SoundSwitch (n34) is unused by rbp: repurpose as SOURCE. */
+          add_note(15, 34, K_SOURCE, CH_GLOBAL);
+          add_abs(15, 14, K_XFADER, CH_GLOBAL);     /* crossfader */
+          add_abs(15, 9,  K_HPMIX, CH_GLOBAL);      /* cue mix */
+          add_abs(15, 10, K_HPLEVEL, CH_GLOBAL);    /* cue gain */
+          /* CC15 master / CC17 speaker in the CC dispatch. */
+          /* DJ FX on ch 4/5: activate paddle n4 -> Beat FX on/off.  Effect
+           * select buttons n0..n3 (Echo/Flanger/Delay/Phaser) need the rbp
+           * type-position table verified on hardware; left unmapped for now. */
+          add_note(4, 4, K_BFX, CH_GLOBAL);
+          add_note(5, 4, K_BFX, CH_GLOBAL);
+     }
 
-     /* ---- decks (rch 4 = left -> deck1, rch 5 = right -> deck2) ---- */
+     /* ---- decks ---- */
      for (int d = 0; d < 2; d++) {
-          int rch = 4 + d;
+          int rch = g_deck_ch[d];
           int sch = 1 + d;
+          if (g_nh08s) {
+               /* NH08S QML deck: Load n1 (left) / n2 (right), Sync 8,
+                * Cue 9, Play 10, modes 11/12/14/13, pads 15..22, Shift 28,
+                * pitch bend 29/30, jog touch 33, Wheel n35. */
+               /* The panel actually sends LOAD on ch15 (see above); keep the
+                * deck-channel mapping as a harmless fallback. */
+               add_note(rch, d + 1, K_LOAD, sch);   /* Load left n1 / right n2 */
+               add_note(rch, 8,  K_SYNC, sch);
+               add_note(rch, 9,  K_CUE, sch);
+               add_note(rch, 10, K_PLAY, sch);
+               add_note(rch, 11, K_HOTCUE, sch);    /* pad mode 1: HOT CUE */
+               add_note(rch, 12, K_ALOOP, sch);     /* pad mode 2: LOOPS/AUTO */
+               add_note(rch, 14, K_SLIPLOOP, sch);  /* pad mode 3: ROLL/SAMPLER */
+               add_note(rch, 13, K_BEATJUMP, sch);  /* pad mode 4: SLICER */
+               for (int p = 0; p < 8; p++)
+                    add_note(rch, 15 + p, K_PAD1 + p, sch);
+               add_note(rch, 29, K_TEMPO_RANGE, sch);
+               add_note(rch, 30, K_MT, sch);
+               add_note(rch, 33, K_JOG_TOUCH, sch);
+               add_note(rch, 35, K_VINYL, sch);     /* Wheel button */
+               continue;
+          }
           /* CENSOR (ch4/ch5 note1) is remapped to the RX3 RELOOP/EXIT key:
            * exits a running loop, and re-enters it when a loop is stored. */
           add_note(rch, 1, K_RELOOP, sch);
@@ -1439,11 +2001,13 @@ static void build_maps(void)
           add_note(rch, 13, 0, sch);           /* PFL: no RX3 code, log-only */
      }
 
-     /* ---- DJ FX (global ch 15) ----
+     /* ---- JP21 DJ FX (global ch 15) ----
       * (turn-encoders CC35/CC36/CC40 need relative-encoder handling and are
-      *  handled separately below.) */
-     add_note(15, 26, K_BFX, CH_GLOBAL);       /* FX activate (0x448d) */
-     add_abs(15, 4,  K_DEPTH, CH_GLOBAL);      /* FX wet/dry knob (0x448f) */
+      *  handled separately below.)  NH08S has its FX on ch 4/5 instead. */
+     if (!g_nh08s) {
+          add_note(15, 26, K_BFX, CH_GLOBAL);       /* FX activate (0x448d) */
+          add_abs(15, 4,  K_DEPTH, CH_GLOBAL);      /* FX wet/dry knob (0x448f) */
+     }
      /* ch15 note 25 (TIME-knob push) is deliberately NOT mapped to TAP: it is
       * used as the modifier for BEAT < / BEAT > instead (see handle_fx_time).
       * Both BEAT buttons need op == press: asEventCode gates 0x4490/0x4491
@@ -1465,9 +2029,26 @@ static void *midi_thread(void *arg)
      s = getenv("JOG_SCALE");
      if (s) jog_scale = atoi(s);
      if (jog_scale < 1) jog_scale = 1;
+     /* The NH08S jog reports ~1638 counts per revolution (the Engine QML's
+      * JogWheel sensitivity is 1638.7 * 3.6).  Using the JP21's 128 made the
+      * speed saturate after a few centimetres of travel.  One revolution now
+      * equals one rev/s, so a normal spin stays inside rbp's +-8 clamp. */
+     jog_ppr = g_nh08s ? 1638 : 128;
      s = getenv("JOG_PPR");
      if (s) jog_ppr = atoi(s);
      if (jog_ppr < 1) jog_ppr = 1;
+     /* NH08S: hand rbp a 3600-pulse revolution (rbp's own jog scale, see
+      * JogPulse::SAMPLE_PER_PULSE_ = 12.25) and lift the speed a little so
+      * small nudges get past rbp's 0.5 rev/s pitch-bend dead zone.  SC Live 4
+      * keeps the previous behaviour. */
+     jog_out_ppr = g_nh08s ? 3600 : 0;
+     jog_speed_gain = g_nh08s ? 1.5f : 1.0f;
+     s = getenv("JOG_OUT_PPR");
+     if (s) jog_out_ppr = atoi(s);
+     if (jog_out_ppr < 0) jog_out_ppr = 0;
+     s = getenv("JOG_SPEED_GAIN");
+     if (s) jog_speed_gain = (float)atof(s);
+     if (jog_speed_gain <= 0.0f) jog_speed_gain = 1.0f;
      jog_rev = getenv("JOG_REV") != NULL;
      s = getenv("JOG_IDLE_MS");
      if (s) jog_idle_ms = atoi(s);
@@ -1844,7 +2425,7 @@ static void led_apply(int deck, int idx, int on)
      signed char want = (signed char)(on ? 1 : 0);
      if (led_last[deck][idx] == want)
           return;
-     if (!led_send(4 + deck, led_notes[idx], on ? 0x7f : 0x00))
+     if (!led_send(g_deck_ch[deck], led_notes[idx], on ? 0x7f : 0x00))
           return;                        /* retry next tick */
      led_last[deck][idx] = want;
      if (led_verbose)
@@ -1903,12 +2484,63 @@ static void led_pad_apply(int deck, int pad, unsigned char vel)
 {
      if (led_pad_last[deck][pad] == (int)vel)
           return;
-     if (!midi_note(4 + deck, 15 + pad, vel))
+     if (!midi_note(g_deck_ch[deck], 15 + pad, vel))
           return;                        /* retry next tick */
      led_pad_last[deck][pad] = vel;
      if (led_verbose)
           klog("knobshim2: pad deck%d pad%d vel=0x%02x\n",
                deck + 1, pad + 1, vel);
+}
+
+/* NH08S pad LEDs.  The panel pads are single-colour (LedType.Simple in the
+ * NH08S QML), so only on/off is meaningful - a colour velocity would be
+ * ignored or produce an unpredictable colour.  Four physical pads, driven
+ * from rbp's live pad mode (+0x74) and from rbp's own pad LED state
+ * (LedDef::ID 18..25) for HOT CUE and BEAT JUMP.  The four pad-mode buttons
+ * light the mode rbp is actually in. */
+static void nh08s_pad_leds(int deck, int blink)
+{
+     static const int mode_note[4] = { 11, 12, 14, 13 };
+     static signed char mode_last[2][4] = {
+          { -1, -1, -1, -1 }, { -1, -1, -1, -1 }
+     };
+     int mode = nh08s_pad_mode(deck);
+     int shift = shift_dn[deck];
+
+     for (int m = 0; m < 4; m++) {
+          int on = (mode == m);
+          if (mode_last[deck][m] == on)
+               continue;
+          if (!midi_note(g_deck_ch[deck], mode_note[m], on ? 0x7f : 0x00))
+               continue;
+          mode_last[deck][m] = (signed char)on;
+          if (led_verbose)
+               klog("knobshim2: led deck%d padmode note%d %s\n",
+                    deck + 1, mode_note[m], on ? "on" : "off");
+     }
+
+     for (int p = 0; p < 4; p++) {
+          int on = 0;
+          if (mode == 0) {
+               int st = ledstat_state(LED_PAD_FIRST + (unsigned)p,
+                                      (unsigned)deck + 1);
+               on = (st == 2) ? blink : (st > 0);
+          } else if (mode == 1 || mode == 2) {
+               on = 1;              /* LOOPS / SLIP LOOP: all pads */
+          } else if (mode == 3) {
+               if (shift) {
+                    on = 1;         /* SHIFT layer = pads 5..8 */
+               } else {
+                    int st = ledstat_state(LED_PAD_FIRST + (unsigned)p,
+                                           (unsigned)deck + 1);
+                    on = (st == 2) ? blink : (st > 0);
+               }
+          }
+          led_pad_apply(deck, p, on ? 0x7f : 0x00);
+     }
+     /* pads 5..8 do not exist on the panel; make sure they stay dark */
+     for (int p = 4; p < 8; p++)
+          led_pad_apply(deck, p, 0x00);
 }
 
 /* Global (channel-15) panel LEDs, driven straight from rbp's LedStat.
@@ -1940,6 +2572,64 @@ static void led_apply_g(int idx, int note, int on)
                note, on ? "on" : "off", led_g_tab[idx].name);
 }
 
+/* ---- NH08S Beat FX select LEDs ---------------------------------------
+ * The four DJFxSelect buttons (ch4 notes 0..3, printed Echo / Flanger /
+ * Delay / Phaser) mirror rbp's currently selected Beat FX.  The byte comes
+ * from ui::StatWatcher::getMixBeatFxType() (0x2c1308):
+ *   g_ui [0x02685f2c] -> [+0x38] -> [+0x1c] -> byte +0xa
+ * and holds the SELECTOR POSITION (0..13), not the engine's
+ * EnBeatEffectType: selecting position 1 stored 1, position 6 stored 6,
+ * position 0 stored 0 and position 9 stored 9 (measured on hardware).
+ * MasterInnards::onEv_BeatEffectType maps 0->Delay(type 6), 1->Echo(5),
+ * 6->Flanger(4), 9->Trans(2), so the LED mapping is position-based too.
+ * An out-of-range/unknown position (or a null StatWatcher before rbp has
+ * initialised) turns all four LEDs off. */
+static int nh08s_bfx_pos(void)
+{
+     void **ui = (void **)UI_OBJ_MGR_GLOBAL;
+     void *o, *sw, *stat;
+     if (!ui)
+          return -1;
+     o = *ui;
+     if (!o)
+          return -1;
+     sw = *(void **)((char *)o + 0x38);
+     if (!sw)
+          return -1;
+     stat = *(void **)((char *)sw + 0x1c);
+     if (!stat)
+          return -1;
+     return *(unsigned char *)((char *)stat + 0xa);
+}
+
+static void led_refresh_fx(void)
+{
+     /* selector position -> panel button note */
+     static const signed char pos_note[14] = {
+          2, 0, -1, -1, -1, -1, 1, -1, -1, 3, -1, -1, -1, -1
+     };
+     static signed char last[4] = { -1, -1, -1, -1 };
+     static int last_pos = -2;
+     int p = nh08s_bfx_pos();
+     int sel = (p >= 0 && p < 14) ? pos_note[p] : -1;
+
+     if (p != last_pos) {
+          last_pos = p;
+          klog("knobshim2: beat fx select pos=%d -> LED note %d\n", p, sel);
+     }
+     for (int n = 0; n < 4; n++) {
+          signed char want = (signed char)(n == sel ? 1 : 0);
+          if (last[n] == want)
+               continue;
+          if (!midi_note(4, n, want ? 0x7f : 0x00))
+               continue;
+          last[n] = want;
+          if (led_verbose)
+               klog("knobshim2: led fx note%d %s\n", n,
+                    want ? "on" : "off");
+     }
+}
+
 static void led_refresh(void)
 {
      void *pe;
@@ -1956,6 +2646,10 @@ static void led_refresh(void)
           led_apply_g(g, led_g_tab[g].note, on);
      }
 
+     /* NH08S deck FX select buttons mirror rbp's selected Beat FX type */
+     if (g_nh08s)
+          led_refresh_fx();
+
      /* mixer PFL LEDs (SC Live 4 strips 1/2, note 13) from rbp's cue state */
      for (int m = 0; m < 2; m++) {
           int cue = me_get_cue(m);
@@ -1966,8 +2660,9 @@ static void led_refresh(void)
                     led_pfl_last[m] = (signed char)cue;
           }
      }
-     /* master cue LED on strips 3/4 (note 13) */
-     {
+     /* master cue LED on strips 3/4 (note 13) — JP21 only; on NH08S ch2/3
+      * are the decks and note 13 is a pad-mode LED. */
+     if (!g_nh08s) {
           static signed char mc_last = -1;
           int mc = me_get_master_cue();
           if (mc >= 0 && mc_last != (signed char)mc) {
@@ -2009,29 +2704,39 @@ static void led_refresh(void)
           /* PLAY: solid while playing, blinks while paused on a loaded
            * track, dark with nothing loaded. */
           led_apply(i, 2, playing ? 1 : (loaded ? blink : 0));
-          led_apply(i, 3, mt);                        /* KEY LOCK */
-          led_apply(i, 4, vinyl);                     /* VINYL */
-          led_apply(i, 5, slip);                      /* SLIP */
-          /* SC Live 4 convention (verified against Engine OS on video):
-           *   idle            -> both LEDs solid ON
-           *   loop-in set     -> LOOP IN blinks, LOOP OUT solid
-           *   loop running    -> both blink */
-          led_apply(i, 6, (looping || armed) ? blink : 1);   /* LOOP IN */
-          led_apply(i, 7, looping ? blink : 1);              /* LOOP OUT */
-          led_apply(i, 8, aloop);                            /* AUTO LOOP */
+          if (!g_nh08s) {
+               led_apply(i, 3, mt);                   /* KEY LOCK */
+               led_apply(i, 4, vinyl);                /* VINYL */
+               led_apply(i, 5, slip);                 /* SLIP */
+               /* SC Live 4 convention (verified against Engine OS on video):
+                *   idle            -> both LEDs solid ON
+                *   loop-in set     -> LOOP IN blinks, LOOP OUT solid
+                *   loop running    -> both blink */
+               led_apply(i, 6, (looping || armed) ? blink : 1);   /* LOOP IN */
+               led_apply(i, 7, looping ? blink : 1);              /* LOOP OUT */
+               led_apply(i, 8, aloop);                            /* AUTO LOOP */
+          } else {
+               /* NH08S has only the Wheel (n35) of these. */
+               led_apply(i, 4, vinyl);
+          }
 
-          /* RGB performance pads: rbp LedDef::ID 18..25 -> notes 15..22 */
-          for (int p = 0; p < LED_PAD_COUNT; p++) {
-               unsigned char rgb[3];
-               int st = ledstat_state(LED_PAD_FIRST + (unsigned)p, (unsigned)i + 1);
-               if (st <= 0 ||
-                   !ledstat_rgb(LED_PAD_FIRST + (unsigned)p, (unsigned)i + 1, rgb)) {
-                    led_pad_apply(i, p, 0);
-               } else if (st == 2) {
-                    led_pad_apply(i, p, blink
-                         ? pad_encode_rgb(rgb[0], rgb[1], rgb[2]) : 0);
-               } else {
-                    led_pad_apply(i, p, pad_encode_rgb(rgb[0], rgb[1], rgb[2]));
+          /* Performance pads.  NH08S: four single-colour pads driven from
+           * rbp's pad mode/state; JP21: eight RGB pads from LedStat. */
+          if (g_nh08s) {
+               nh08s_pad_leds(i, blink);
+          } else {
+               for (int p = 0; p < LED_PAD_COUNT; p++) {
+                    unsigned char rgb[3];
+                    int st = ledstat_state(LED_PAD_FIRST + (unsigned)p, (unsigned)i + 1);
+                    if (st <= 0 ||
+                        !ledstat_rgb(LED_PAD_FIRST + (unsigned)p, (unsigned)i + 1, rgb)) {
+                         led_pad_apply(i, p, 0);
+                    } else if (st == 2) {
+                         led_pad_apply(i, p, blink
+                              ? pad_encode_rgb(rgb[0], rgb[1], rgb[2]) : 0);
+                    } else {
+                         led_pad_apply(i, p, pad_encode_rgb(rgb[0], rgb[1], rgb[2]));
+                    }
                }
           }
 
@@ -2195,9 +2900,19 @@ static int midi_cc(int midi_ch, int cc, int val)
  * channel meters ignore the fader. */
 static void led_query_absolute(void)
 {
-     static const unsigned char sysex[10] = {
+     /* JP21: F0 00 02 0B 7F 12 04 00 00 F7
+      * NH08S: F0 00 01 3F 7F 3F 04 00 00 F7
+      * (`queryAbsoluteControls()` in each *_Controller_Device.qml).  The
+      * panel answers with a stream of CC messages for every knob/fader; the
+      * NH08S has no Pioneer-style initial values, so this is what makes the
+      * channel faders/EQs reach rbp at startup. */
+     static const unsigned char sysex_jp21[10] = {
           0xF0, 0x00, 0x02, 0x0B, 0x7F, 0x12, 0x04, 0x00, 0x00, 0xF7
      };
+     static const unsigned char sysex_nh08s[10] = {
+          0xF0, 0x00, 0x01, 0x3F, 0x7F, 0x3F, 0x04, 0x00, 0x00, 0xF7
+     };
+     const unsigned char *sysex = g_nh08s ? sysex_nh08s : sysex_jp21;
      int i;
      if (led_fd < 0)
           return;
@@ -2207,7 +2922,7 @@ static void led_query_absolute(void)
       * never be re-applied (the control then reads default until moved once). */
      for (i = 0; i < abs_map_n; i++)
           abs_map[i].last = -1;
-     (void)write(led_fd, sysex, sizeof(sysex));
+     (void)write(led_fd, sysex, 10);
 }
 
 /* Map a linear master peak (S24 full scale) to the SC Live 4 meter bitmask.
@@ -2280,7 +2995,7 @@ static void install_meter_hook(void)
      memcpy(g_tramp, saved, 8);                 /* displaced instructions */
      *(uint32_t *)(g_tramp + 8) = 0xE51FF004u;  /* ldr pc,[pc,#-4] */
      *(uint32_t *)(g_tramp + 12) = (uint32_t)(p + 8);
-     g_orig_getled = (unsigned char (*)(void *, unsigned char))g_tramp;
+     g_orig_getled = (unsigned int (*)(void *, unsigned char))g_tramp;
 
      pg = (unsigned long)p & ~(unsigned long)(pgsz - 1);
      if (mprotect((void *)pg, pgsz, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
@@ -2396,6 +3111,62 @@ static int vu_master_segments(void)
      return (1 << out) - 1;
 }
 
+/* NH08S VU LEDs are incremental (VULedCCIndexing.Incremental) on the GLOBAL
+ * MIDI channel 15: CC 32 = left, CC 33 = right (NH08S_Controller_Assignments
+ * .qml, VUMeter model), and the panel's two strips have FIVE LEDs each.  The
+ * QML's ledCCValues [0,14,27,40,53,66] are the six steps "0 LEDs lit" ..
+ * "5 LEDs lit".  Sending a bitmask (or channel-strip CCs on ch0/ch1) makes
+ * the meters stay dark. */
+static int nh08s_vu_value(int lit)
+{
+     static const int vals[6] = { 0, 14, 27, 40, 53, 66 };
+     if (lit < 0)
+          lit = 0;
+     if (lit > 5)
+          lit = 5;
+     return vals[lit];
+}
+
+/* The Mixstream's own five LEDs use the QML thresholds
+ *   dBThresholds: [-35, -25, -21, -15, -3, 30]
+ * i.e. the five LEDs light at -35, -25, -21, -15 and -3 dBFS; the trailing
+ * 30 dB entry is the "above the top LED" sentinel and has no LED of its own.
+ * (The old code reused the JP21 six-LED thresholds and then rescaled 6 -> 5,
+ * which made the top two LEDs unreachable at ordinary levels: the panel lit
+ * only three of five.)
+ *
+ * Measured on the Mixstream: rbp's post-Main-Vol master peaks around
+ * -8 dBFS on loud material at full master, so the QML's -3 dBFS top step
+ * never lit.  The top step is therefore -10 dBFS; the lower four stay at the
+ * QML values.  VU_OFFSET_DB still shifts the whole scale for calibration
+ * (positive = more sensitive, default 0). */
+static double vu_offset_db = 0.0;
+
+static int nh08s_lit_from_db(double db)
+{
+     static const double th[5] = { -35.0, -25.0, -21.0, -15.0, -10.0 };
+     int n = 0;
+     db += vu_offset_db;
+     for (int i = 0; i < 5; i++)
+          if (db >= th[i])
+               n = i + 1;
+     return n;
+}
+
+/* audioshim publishes g_vu_peak AFTER the Main Vol gain, i.e. this is the
+ * actual output level, so the meters follow the master knob (turning it down
+ * lowers the reading) and L/R stay independent. */
+static int nh08s_lit_from_peak(int peak)
+{
+     double db;
+     if (peak <= 0)
+          return 0;
+     if (peak > 8388607)
+          peak = 8388607;
+     db = 20.0 * log10((double)peak / 8388607.0);
+     return nh08s_lit_from_db(db);
+}
+
 static void *vu_thread(void *arg)
 {
      unsigned long t = 0;
@@ -2407,6 +3178,11 @@ static void *vu_thread(void *arg)
           return NULL;
      vu_test = getenv("VU_TEST") != NULL;
      vu_debug = getenv("VU_DEBUG") != NULL;
+     if (g_nh08s) {
+          const char *s = getenv("VU_OFFSET_DB");
+          if (s && *s)
+               vu_offset_db = atof(s);
+     }
      for (int i = 0; i < 300 && led_fd < 0; i++)
           usleep(100000);
      if (led_fd < 0)
@@ -2420,6 +3196,10 @@ static void *vu_thread(void *arg)
           usleep(100000);
      led_query_absolute();
      klog("knobshim2: VU bridge up%s\n", vu_test ? " (TEST sweep)" : "");
+     if (g_nh08s)
+          klog("knobshim2: NH08S VU -> ch15 CC32/CC33 incremental "
+               "[0,14,27,40,53,66], 5-LED stereo main pair, post-Main-Vol, "
+               "offset %.1f dB\n", vu_offset_db);
 
      for (;;) {
           int l, r;
@@ -2432,37 +3212,74 @@ static void *vu_thread(void *arg)
                me_set_stereo(1);     /* default: stereo (0 = mono split) */
                klog("knobshim2: master cue enabled at startup\n");
           }
-          if (vu_test) {
-               int seg = (int)((t / 40) % 8);      /* 0..7 segments, ~1 s/step */
-               l = r = (seg > 6) ? 63 : ((1 << seg) - 1);
-          } else {
-               if (g_meter_bits[0]) {
-                    l = r = vu_master_segments();
+          if (g_nh08s) {
+               /* Mixstream: ONE stereo main-level meter pair, CC32/CC33 on
+                * the GLOBAL channel 15 (the VUMeter block inherits the QML's
+                * GlobalAssignmentConfig midiChannel: 15).  The panel's "VU
+                * Meter Mode" defaults to Main, so drive L/R from the master
+                * output: audioshim's peaks are post-Main-Vol, so the pair
+                * follows the master knob and keeps real stereo balance.
+                * rbp's master meter (mono) is only a fallback.  The strips
+                * take incremental values [0,14,27,40,53,66], NOT a segment
+                * bitmask. */
+               int lit[2];
+               if (vu_test) {
+                    int seg = (int)((t / 40) % 7);   /* 0..6, ~1 s per step */
+                    lit[0] = lit[1] = (seg > 5) ? 5 : seg;
                } else {
-                    l = vu_segments(g_vu_peak[0]);
-                    r = vu_segments(g_vu_peak[1]);
+                    /* Independent L/R from the post-Main-Vol peak, so the
+                     * pair tracks the master knob and real stereo balance.
+                     * No fallback to rbp's own master meter: that meter is
+                     * PRE-Main-Vol (mono), so with the master turned down it
+                     * kept lighting the LEDs from the channel level. */
+                    lit[0] = nh08s_lit_from_peak(g_vu_peak[0]);
+                    lit[1] = nh08s_lit_from_peak(g_vu_peak[1]);
                }
-          }
-          if (l != last_l) {
-               midi_cc(15, 32, l);
-               last_l = l;
-          }
-          if (r != last_r) {
-               midi_cc(15, 33, r);
-               last_r = r;
-          }
+               for (int m = 0; m < 2; m++) {
+                    int cv = nh08s_vu_value(lit[m]);
+                    if (cv != last_c[m + 1]) {
+                         midi_cc(15, 32 + m, cv);
+                         last_c[m + 1] = cv;
+                    }
+               }
+          } else {
+               if (vu_test) {
+                    int seg = (int)((t / 40) % 8); /* 0..7 segments, ~1 s/step */
+                    l = r = (seg > 6) ? 63 : ((1 << seg) - 1);
+               } else {
+                    if (g_meter_bits[0]) {
+                         l = r = vu_master_segments();
+                    } else {
+                         l = vu_segments(g_vu_peak[0]);
+                         r = vu_segments(g_vu_peak[1]);
+                    }
+               }
+               if (l != last_l) {
+                    midi_cc(15, 32, l);
+                    last_l = l;
+               }
+               if (r != last_r) {
+                    midi_cc(15, 33, r);
+                    last_r = r;
+               }
 
-          /* Channel meters 1/2 come straight from rbp's own meter bitmask
-           * (g_meter_bits, filled by the getLedValue hook): the number of
-           * segments rbp lit is scaled to the SC Live 4 6-segment meter. */
-          for (int m = 1; m <= 2; m++) {
-               int v = vu_channel_segments(g_meter_bits[m], g_fader[m]);
-               if (v != last_c[m]) {
-                    midi_cc(m - 1, 10, v);     /* CC10 on ch0 = ch1, ch1 = ch2 */
-                    last_c[m] = v;
+               /* Channel meters 1/2 come straight from rbp's own meter bitmask
+                * (g_meter_bits, filled by the getLedValue hook): the number of
+                * segments rbp lit is scaled to the SC Live 4 6-segment meter. */
+               for (int m = 1; m <= 2; m++) {
+                    int v = vu_channel_segments(g_meter_bits[m], g_fader[m]);
+                    if (v != last_c[m]) {
+                         midi_cc(m - 1, 10, v);     /* CC10 on ch0 = ch1, ch1 = ch2 */
+                         last_c[m] = v;
+                    }
                }
           }
-          if (vu_debug && (t % 40) == 0)
+          if (vu_debug && g_nh08s && (t % 40) == 0)
+               klog("knobshim2: vudbg master=%03x seg=%d/%d peak=%d/%d "
+                    "gain=%.3f\n",
+                    g_meter_bits[0], last_c[1], last_c[2],
+                    g_vu_peak[0], g_vu_peak[1], (double)g_master_gain);
+          if (vu_debug && !g_nh08s && (t % 40) == 0)
                klog("knobshim2: vudbg master=%03x ch1=%03x ch2=%03x seg=%d/%d "
                     "fader=%d/%d seen=%d/%d\n",
                     g_meter_bits[0], g_meter_bits[1], g_meter_bits[2],
@@ -2477,9 +3294,36 @@ static void *vu_thread(void *arg)
            * while the user is actively working. */
           if (t < 1200 && (t % 80) == 0) {
                led_query_absolute();
+               /* NH08S has no QUANTIZE button: keep deck 1/2 and Beat FX
+                * quantize OFF for the first ~30 s, while rbp's engine and
+                * effect manager finish initialising. */
+               if (g_nh08s)
+                    nh08s_quantize_off();
                /* rbp's mixer inits after we load, so the one-shot unity master
                 * level in init() is dropped - re-assert it for ~30 s. */
                send_rx_key_f(K_MASTERLVL, OP_VALUE, CH_GLOBAL, 1023, 1.0f);
+               if (g_nh08s) {
+                    /* Mixstream Sweep FX = Sound Color FX, and the user wants
+                     * Filter selected by default.  The one-shot select in
+                     * init() also runs before rbp's mixer exists and is
+                     * dropped, exactly like the master level, which is why
+                     * turning the Sweep knob did nothing.  The select buttons
+                     * are radio-style, so re-pressing Filter is idempotent.
+                     * Seed the parameter at 50 % only until the panel has
+                     * reported CC11, then leave it entirely to the knob. */
+                    static int cfx_logged = 0;
+                    if (!cfx_logged) {
+                         cfx_logged = 1;
+                         klog("knobshim2: Sound Color FX -> Filter re-assert "
+                              "(mixer ch1/2), parameter seed 50%%\n");
+                    }
+                    for (int c = 1; c <= 2; c++) {
+                         send_rx_key(K_FILTER, OP_PRESS, c, 0);
+                         send_rx_key(K_FILTER, OP_RELEASE, c, 0);
+                         if (!g_color_seen[c])
+                              send_rx_key_f(K_COLOR, OP_VALUE, c, 512, 0.5f);
+                    }
+               }
           } else if ((!g_fader_seen[1] || !g_fader_seen[2]) && (t % 80) == 0)
                led_query_absolute();
           t++;
@@ -2516,6 +3360,7 @@ __attribute__((constructor))
 static void knobshim2_init(void)
 {
      pthread_t tid;
+     detect_product();
      led_sweep = getenv("LED_SWEEP") != NULL;   /* must be known before
                                                  * spawning the sweep thread */
      if (pthread_create(&tid, NULL, vu_thread, NULL) == 0)

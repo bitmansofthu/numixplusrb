@@ -1,12 +1,20 @@
 # scripts/device/
 
-On-device scripts (ship to `/data/` on the SC Live 4).
+On-device scripts (ship to `/data/` on the SC Live 4 or Mixstream Pro / Pro Plus).
 
 | Script | Purpose |
 |---|---|
 | `fix-dev.sh` | bind mounts (`/dev /proc /sys /tmp`), device stubs, `/tmp/udev_*` FIFOs, `etc/mtab` symlink. Run after every reboot. |
-| `start-rb.sh` | stop Engine OS + `edisksd`, prepare the chroot, start `edb_streamd` then `rbp`, start the USB watcher. |
-| `usb-watch.sh` | hotplug the USB-A media port (`usb1`), mount + bind into the chroot, notify rbp via `/tmp/udev_usb1`; retries until rbp opens `export.pdb`. |
+| `start-rb.sh` | stop Engine OS + `edisksd`, prepare the chroot, select the JP21/NH08 audio layout from the device tree, start `edb_streamd` then `rbp`, start the USB watcher. |
+| `start-rbp-debug.sh` | same, but detached with `KNOB_VERBOSE=1` + `FBSHIM_DEBUG=1` and an `aseqdump` raw-MIDI capture; logs go to `/tmp/{knobshim,audioshim,seqdump}.log` and touch events to `/data/rbp-p.log`. Re-running restarts rbp. |
+| `stop-rbp` | stop rbp + `edb_streamd` + the USB watcher (panel keeps the last frame; Engine is **not** restarted). |
+| `stop-rbp-return-engine.sh` | `stop-rbp`, then `reset-failed` + start `engine.service` and the `edisksd`/`enginex-*` units. |
+| `usb-watch.sh` | hotplug either USB-A media port, mount + bind into the chroot as USB1 (`/media/usb1/sda1`), notify rbp via `/tmp/udev_usb1`; retries until rbp opens `export.pdb`. |
+
+Source selection on the Mixstream (no hardware SOURCE button): push **Browse**
+with no source selected to open rbp's SOURCE menu, push again to select USB1;
+**SoundSwitch** also opens SOURCE. Implemented in `knobshim2.c`, see
+[docs/10](../../docs/10-usb.md).
 
 Also needed on the device:
 
