@@ -9,10 +9,15 @@ CROSS ?= arm-linux-gnueabihf-
 CC    := $(CROSS)gcc
 
 .PHONY: all clean
-all: timeout
+all: timeout poweroff-hook.so
 
 timeout: timeout.c
 	$(CC) -O2 -static -Wall -Wextra -o $@ $<
 
+# LD_PRELOADed into /usr/bin/az01-pwrbtn: runs /data/rbp-shutdown.sh before
+# the daemon's real poweroff syscall. Hard-float, like the stock daemon.
+poweroff-hook.so: poweroff-hook.c
+	$(CC) -O2 -fPIC -shared -Wall -Wextra -o $@ $<
+
 clean:
-	rm -f timeout
+	rm -f timeout poweroff-hook.so

@@ -3,6 +3,38 @@
 # Supports the Denon SC Live 4 (JP21) and the Numark Mixstream Pro / Pro Plus
 # (NH08/NH08S); the audio layout is selected from the device tree model data.
 
+# --- power-button hook ------------------------------------------------------
+# /etc is read-only, so install a runtime drop-in under /run/systemd/system.
+# The stock az01-pwrbtn daemon then preloads /data/poweroff-hook.so, whose
+# reboot() wrapper runs /data/rbp-shutdown.sh before the real poweroff syscall.
+# stop-rbp-return-engine.sh removes the drop-in when handing back to Engine OS.
+install_power_hook() {
+    if ! systemctl cat az01-power-button.service >/dev/null 2>&1; then
+        echo "power hook: az01-power-button.service not present; skipped"
+        return 0
+    fi
+    if [ ! -f /data/poweroff-hook.so ] || [ ! -f /data/rbp-shutdown.sh ]; then
+        echo "power hook: /data/poweroff-hook.so or /data/rbp-shutdown.sh missing"
+        return 0
+    fi
+    d=/run/systemd/system/az01-power-button.service.d
+    mkdir -p "$d"
+    cat > "$d/override.conf" <<'EOF'
+[Service]
+Environment=LD_PRELOAD=/data/poweroff-hook.so
+EOF
+    systemctl daemon-reload 2>/dev/null
+    systemctl restart az01-power-button.service 2>/dev/null
+    if ! systemctl is-active --quiet az01-power-button.service 2>/dev/null; then
+        echo "power hook: daemon failed to start; removing the drop-in"
+        rm -rf "$d"
+        systemctl daemon-reload 2>/dev/null
+        systemctl restart az01-power-button.service 2>/dev/null
+        return 0
+    fi
+    echo "power hook: installed (LD_PRELOAD=/data/poweroff-hook.so)"
+}
+
 # 1. Stop Engine OS + disk service (releases audio, USB, controls).
 #    On the Mixstream Pro Plus also stop the enginex layer: engine-guardian
 #    can restart Engine, and the enginex-* units hold audio/MIDI/CPU 3.
@@ -27,6 +59,9 @@ fi
 
 # 3. Setup device binds, stubs, and FIFOs
 sh /data/fix-dev.sh
+
+# 3b. Preload the power-button hook for this rbp session.
+install_power_hook
 
 # 4. Deploy binary and shims into the chroot
 cp /data/rbp-audio /data/rbx3-run/root/pdj/rbp
@@ -96,11 +131,17 @@ if [ -n "${SPEAKER_GAIN:-}" ]; then
 fi
 echo "audio layout: $AUDIO_LAYOUT, ${AUDIO_CHANNELS}ch on $AUDIO_DEVICE (master $AUDIO_MASTER_OFFSET, hp $AUDIO_HP_OFFSET, speakers $AUDIO_SPEAKER_OFFSET)"
 
+# SHIFT + SoundSwitch USB stop: pass the runtime mode through to the shim.
+# Default is the RX3-like parallel burst; set USBSTOP_SEQUENTIAL=1 to fall back.
+USBSTOP_ENV=""
+[ -n "${USBSTOP_SEQUENTIAL:-}" ] && USBSTOP_ENV="$USBSTOP_ENV USBSTOP_SEQUENTIAL=$USBSTOP_SEQUENTIAL"
+[ -n "${USBSTOP_GAP_MS:-}" ] && USBSTOP_ENV="$USBSTOP_ENV USBSTOP_GAP_MS=$USBSTOP_GAP_MS"
+
 # 9. Start rbp cleanly inside chroot
 # Panel rotation: the Mixstream Pro Plus is upside down with `left`, so it
 # defaults to `right` here. Override per device with DFB_ROTATE=... if needed.
 DFB_ROTATE=${DFB_ROTATE:-right}
-nohup chroot /data/rbx3-run env PATH=/bin:/sbin:/usr/bin:/usr/sbin DFB_ROTATE=$DFB_ROTATE KNOBSHIM_PRODUCT="${PRODUCT:-$COMPAT}" STARTUP_MUTE_MS=1500 STARTUP_FADE_MS=300 $AUDIO_ENV LD_PRELOAD=/usr/lib/fbshim.so:/usr/lib/knobshim.so:/usr/lib/audioshim.so /lib/ld-linux.so.3 /root/pdj/rbp -a </dev/null >/data/rbp-p.log 2>&1 &
+nohup chroot /data/rbx3-run env PATH=/bin:/sbin:/usr/bin:/usr/sbin DFB_ROTATE=$DFB_ROTATE KNOBSHIM_PRODUCT="${PRODUCT:-$COMPAT}" STARTUP_MUTE_MS=1500 STARTUP_FADE_MS=300 $AUDIO_ENV $USBSTOP_ENV LD_PRELOAD=/usr/lib/fbshim.so:/usr/lib/knobshim.so:/usr/lib/audioshim.so /lib/ld-linux.so.3 /root/pdj/rbp -a </dev/null >/data/rbp-p.log 2>&1 &
 
 echo "launched rbp, waiting for initialization..."
 RBP=""

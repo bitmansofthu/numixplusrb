@@ -19,6 +19,7 @@ Documentation for the XDJ-RX3 `rb` → Denon SC Live 4 port.
 | 12 | [troubleshooting](12-troubleshooting.md) | symptom → cause → fix |
 | 13 | [mixstream-pro-plus-roadmap](13-mixstream-pro-plus-roadmap.md) | Mixstream Pro Plus port feasibility and phased bring-up plan |
 | 14 | [mixstream-pro-plus-survey](14-mixstream-pro-plus-survey.md) | live Mixstream Pro Plus survey (NH08S platform, audio, MIDI, services) |
+| 15 | [nh08s-power-and-eject](15-nh08s-power-and-eject.md) | safe USB eject (`SHIFT + SoundSwitch`) and graceful power-button shutdown |
 
 The matching PrimeBox doc is the upstream reference for anything shared; links
 are in [03-port-plan.md](03-port-plan.md).

@@ -62,6 +62,18 @@ Symptom → cause → fix.
 | Stick never detected | `usb-watch.sh` not running, or wrong bus | SC Live 4 media port is **usb1** (`USBWATCH_BUSES="1 2 3"`) ([10](10-usb.md)) |
 | Generic "USB1", 0 tracks after a restart | stale DeviceSQL guard/req locks | `rm -f /tmp/guard_LocalDBServer /tmp/req_LocalDBServer`, then re-notify ([10](10-usb.md)) |
 | Stick ejects after ~30 s | `edisksd.service` running | stop it in the launcher |
+| SHIFT + SoundSwitch does nothing | SHIFT not held first, or the eject latch is still set | hold deck SHIFT, then press SoundSwitch; watch `/tmp/knobshim.log` with `KNOB_VERBOSE=1` ([15](15-nh08s-power-and-eject.md)) |
+| Only one deck stops on eject | parallel `UsbStop 0x8002` burst coalesced in rbp | restart rbp with `USBSTOP_SEQUENTIAL=1` (`USBSTOP_GAP_MS` to tune) ([15](15-nh08s-power-and-eject.md)) |
+| Eject reports `unmount FAILED` | a file in the mount is still open | stop playback/browser; the script retries lazily and still deletes the device. Full log: `/data/usb-eject.log` ([15](15-nh08s-power-and-eject.md)) |
+| Ejected stick remounts immediately | USB watcher restarted before the device disappeared, or `edisksd` is running | the watcher is stopped during eject; stop `edisksd` ([10](10-usb.md)) |
+
+## Power button
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Power button still hard-powers-off without teardown | hook not installed (missing `/data/poweroff-hook.so` or `/data/rbp-shutdown.sh`) or the daemon failed to restart | `systemctl cat az01-power-button.service` must show the `/run` drop-in; check `/data/start-rb.log` and `/data/rbp-shutdown.log` ([15](15-nh08s-power-and-eject.md)) |
+| Hook remains active after returning to Engine OS | `stop-rbp-return-engine.sh` was not used | remove `/run/systemd/system/az01-power-button.service.d` and restart the unit ([15](15-nh08s-power-and-eject.md)) |
+| No `/data/rbp-shutdown.log` after pressing power | daemon did not call libc `reboot()` or the `.so` failed to load | `systemctl status az01-power-button.service`; check the daemon environment ([15](15-nh08s-power-and-eject.md)) |
 
 ## Audio
 

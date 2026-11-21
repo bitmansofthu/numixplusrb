@@ -19,9 +19,9 @@ keys/*.bin
 /extracted/*
 !/extracted/README.md
 
-# Pioneer / Denon binaries
-rbp
-rbp-*
+# Pioneer / Denon binaries (repo root; extracted trees are ignored above)
+/rbp
+/rbp-*
 !tools/patch-rbp/**
 
 # --- Built shims / objects -------------------------------------------------

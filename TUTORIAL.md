@@ -68,10 +68,19 @@ ssh root@<device> '
 Also ship the on-device helpers once:
 
 ```sh
-make -C scripts/device CROSS=arm-linux-gnueabihf-   # builds ./timeout
+make -C scripts/device CROSS=arm-linux-gnueabihf-   # builds ./timeout + ./poweroff-hook.so
 scp scripts/device/fix-dev.sh scripts/device/start-rb.sh \
-    scripts/device/usb-watch.sh scripts/device/timeout root@<device>:/data/
+    scripts/device/usb-watch.sh scripts/device/usb-eject.sh \
+    scripts/device/rbp-shutdown.sh scripts/device/timeout \
+    scripts/device/poweroff-hook.so root@<device>:/data/
+ssh root@<device> 'chmod 755 /data/usb-eject.sh /data/rbp-shutdown.sh /data/poweroff-hook.so'
 ```
+
+`start-rb.sh` installs a runtime systemd drop-in so the stock power button
+runs `/data/rbp-shutdown.sh` before powering off. On the Mixstream Pro Plus,
+**SHIFT + SoundSwitch** safely ejects all USB media (plain SoundSwitch still
+opens rbp's SOURCE menu). See
+[docs/15](docs/15-nh08s-power-and-eject.md).
 
 ## 4. (Optional) rebuild a shim
 

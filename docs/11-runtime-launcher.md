@@ -145,6 +145,8 @@ Or use the deployed helpers:
 sh /data/stop-rbp                    # stop rbp, edb_streamd, USB watcher, capture
 sh /data/start-rbp-debug.sh          # detached + verbose + aseqdump capture
 sh /data/stop-rbp-return-engine.sh   # stop rbp and restart Engine OS
+sh /data/usb-eject.sh                # unmount + remove all USB media
+sh /data/rbp-shutdown.sh             # graceful teardown (no poweroff; power hook)
 ```
 
 `start-rbp-debug.sh` passes environment overrides through, logs to
@@ -178,6 +180,19 @@ systemctl start engine.service
 systemctl start edisksd.service enginex-rb-bridge.service \
                 enginex-stream-sync.service enginex-sc5000-deemixd.service
 ```
+
+## Power button
+
+`start-rb.sh` installs a runtime systemd drop-in under
+`/run/systemd/system/az01-power-button.service.d/` that preloads
+`/data/poweroff-hook.so` into the stock `az01-pwrbtn` daemon. The daemon keeps
+its own GPIO/debounce timing; its `reboot(RB_POWER_OFF)` call first runs
+`/data/rbp-shutdown.sh` (stop rbp, eject USB, release the chroot binds, `sync`)
+and then performs the real poweroff syscall.
+
+`/etc` is read-only, so the drop-in lives under `/run` and is removed by
+`sh /data/stop-rbp-return-engine.sh` when handing the device back to Engine OS.
+See [15 — NH08S power and eject](15-nh08s-power-and-eject.md).
 
 ## Autostart
 

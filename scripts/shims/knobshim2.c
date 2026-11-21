@@ -101,6 +101,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <sound/asequencer.h>
 
 /* ---- real syscalls (bypass libc interposition) ---- */
@@ -176,6 +177,7 @@ static int is_rbp_process(void)
 #define K_JOG_ROT    0x4305    /* jog wheel rotate: f=speed(rev/s) l=pos */
 #define K_TEMPO_RANGE 0x4107   /* tempo range select (+-6/10/16/WIDE) */
 #define K_MT         0x4108    /* master tempo (key lock) toggle */
+#define K_USBSTOP    0x8002    /* ui::UsbStorageManager "UsbStop" (USB eject) */
 #define K_TEMPO_SLIDER 0x4109  /* tempo slider (pitch fader) */
 #define K_ALOOP      0x4114
 #define K_HOTCUE     0x4113
@@ -887,6 +889,74 @@ static int nh08s_pad_mode(int deck)
      return (int)(*(unsigned char *)((char *)d + NH08S_STAT_PADMODE) & 3);
 }
 
+/* ---- NH08S SHIFT + SoundSwitch: native USB stop + host-side eject -------
+ *
+ * rbp's ui::UsbStorageManager::onKey() only accepts the native "UsbStop"
+ * keycode (0x8002) on the manager's own channel, and rbp creates one manager
+ * per USB source (channels 1 and 2).  The physical RX3 has two USB STOP
+ * buttons, so the default here mirrors pressing both at once: press both
+ * channels, then release both, with no gap.  If that races in rbp's
+ * UsbStopReqHandler, set USBSTOP_SEQUENTIAL=1 to send channel 1, wait
+ * USBSTOP_GAP_MS (default 150 ms), then channel 2.
+ *
+ * rbp runs inside the chroot and cannot exec /data/usb-eject.sh.  It writes a
+ * short request to /tmp (bind-mounted from the host) and the host-side
+ * usb-watch.sh consumes it and runs the eject script. */
+#define USB_EJECT_REQ "/tmp/usb-eject.req"
+
+static volatile int usb_eject_active = 0;
+
+static void usbstop_channel(int ch)
+{
+     send_rx_key(K_USBSTOP, OP_PRESS, ch, 0);
+     send_rx_key(K_USBSTOP, OP_RELEASE, ch, 0);
+}
+
+static void usb_eject_request(const char *mode)
+{
+     int fd = real_open(USB_EJECT_REQ, O_WRONLY | O_CREAT | O_TRUNC);
+     char buf[96];
+     int n;
+
+     if (fd < 0) {
+          klog("knobshim2: usb-eject request failed: %s\n", strerror(errno));
+          return;
+     }
+     /* usb-watch.sh compares this with `date +%s`; use wall-clock seconds,
+      * not CLOCK_MONOTONIC uptime, or the request is treated as stale. */
+     n = snprintf(buf, sizeof(buf), "%lu %s\n",
+                  (unsigned long)time(NULL), mode);
+     if (n > 0)
+          (void)write(fd, buf, (size_t)n);
+     real_close(fd);
+     klog("knobshim2: usb-eject request -> %s (%s)\n", USB_EJECT_REQ, mode);
+}
+
+static void *usb_stop_thread(void *arg)
+{
+     const char *s = getenv("USBSTOP_SEQUENTIAL");
+     int sequential = (s && *s && strcmp(s, "0") != 0);
+
+     (void)arg;
+     if (sequential) {
+          const char *g = getenv("USBSTOP_GAP_MS");
+          int gap = (g && atoi(g) > 0) ? atoi(g) : 150;
+          klog("knobshim2: usb stop sequential: ch1, %d ms, ch2\n", gap);
+          usbstop_channel(1);
+          usleep((useconds_t)gap * 1000);
+          usbstop_channel(2);
+     } else {
+          klog("knobshim2: usb stop parallel: ch1+ch2\n");
+          send_rx_key(K_USBSTOP, OP_PRESS, 1, 0);
+          send_rx_key(K_USBSTOP, OP_PRESS, 2, 0);
+          send_rx_key(K_USBSTOP, OP_RELEASE, 1, 0);
+          send_rx_key(K_USBSTOP, OP_RELEASE, 2, 0);
+     }
+     usb_eject_request(sequential ? "sequential" : "parallel");
+     usb_eject_active = 0;
+     return NULL;
+}
+
 static void handle_note(int ch, int note, int on)
 {
      /* SC Live 4 mixer PFL buttons (strips 1/2 = ch 0/1, note 13): toggle
@@ -1037,6 +1107,27 @@ static void handle_note(int ch, int note, int on)
                klog("knobshim2: deck%d shift -> 0x4103 %s\n", d + 1,
                     on ? "press" : "release");
      }
+
+     /* NH08S SHIFT + SoundSwitch (the printed "lighting" button, n34) =
+      * safe USB stop/eject.  An unshifted press keeps its SOURCE mapping in
+      * note_map below.  The stop is sent from a one-shot worker so the MIDI
+      * callback never blocks; see usb_stop_thread() for parallel/sequential. */
+     if (g_nh08s && ch == 15 && note == 34 && shift_down && on) {
+          if (!usb_eject_active) {
+               pthread_t tid;
+               usb_eject_active = 1;
+               if (pthread_create(&tid, NULL, usb_stop_thread, NULL) == 0) {
+                    pthread_detach(tid);
+               } else {
+                    usb_eject_active = 0;
+                    klog("knobshim2: usb stop thread create failed\n");
+               }
+          } else if (verbose) {
+               klog("knobshim2: shift+SoundSwitch ignored (eject in progress)\n");
+          }
+          return;
+     }
+
      if (ch == 15 && note == 25)
           fx_time_btn = on;
 

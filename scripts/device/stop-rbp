@@ -1,0 +1,15 @@
+#!/bin/sh
+# stop-rbp — stop the rekordbox player, its daemons and the USB watcher.
+# The panel keeps the last frame; Engine OS is NOT restarted.
+# Use /data/stop-rbp-return-engine.sh to hand the device back to Engine.
+
+sh /data/usb-watch.sh stop 2>/dev/null
+
+# Matches the loader's process name, which both rbp and edb_streamd use.
+# Do not use "pkill -f": it also matches an SSH shell running this command.
+pkill -9 ld-linux.so.3 2>/dev/null
+
+# Optional raw MIDI capture from start-rbp-debug.sh.
+pkill aseqdump 2>/dev/null
+
+echo "rbp stopped"

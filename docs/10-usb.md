@@ -64,12 +64,34 @@ The detection uses rbp's live state: `browseMode` at `0x326f8b8`,
 browse device at `0x326f8bc` (0 = none, 3 = USB1) and the mounted
 `PIONEER/rekordbox/export.pdb`.
 
+## Safe eject (Mixstream Pro Plus)
+
+**SHIFT + SoundSwitch** stops rbp's USB managers (native `UsbStop 0x8002` on
+manager channels 1 and 2), then hands a request to the host-side watcher:
+
+```
+knobshim2 → /tmp/usb-eject.req → usb-watch.sh (exits) → /data/usb-eject.sh
+```
+
+`usb-eject.sh` unmounts the chroot bind and every mount backed by a USB `sdX`,
+syncs, and removes each device via `echo 1 > /sys/block/sdX/device/delete`
+(`udisksctl power-off` is used only if that tool exists). The watcher restarts
+afterwards, so a reinserted stick mounts as USB1 again without restarting rbp.
+An unshifted **SoundSwitch** press still opens SOURCE.
+
+rbp needs a parallel stop burst by default; if only one deck stops on hardware,
+start rbp with `USBSTOP_SEQUENTIAL=1` (and optionally
+`USBSTOP_GAP_MS=150`). Full details and the power-button shutdown hook are in
+[15 — NH08S power and eject](15-nh08s-power-and-eject.md).
+
 ## Files
 
 * `scripts/device/usb-watch.sh` — hotplug watcher (SC Live 4 buses), shipped to
   `/data/usb-watch.sh`.
+* `scripts/device/usb-eject.sh` — safe eject of all USB media (`/data/usb-eject.sh`),
+  triggered by SHIFT + SoundSwitch ([15](15-nh08s-power-and-eject.md)).
 * `/data/timeout` — a small ARM `timeout(1)` helper required by
-  `usb-watch.sh notify()`.
+  `usb-watch.sh notify()` and the eject script's FIFO write.
 * `fix-dev.sh` creates the `/tmp/udev_*` FIFOs and the `/etc/mtab` symlink.
 
 ## Run

@@ -652,8 +652,11 @@ The NH08S map has no SOURCE key. `knobshim2.c` adds:
 | **Browse push** with a mounted stick and no source selected | `0x0201` K_SOURCE | opens rbp's SOURCE menu (no hardware SOURCE button) |
 | **Browse push** in the SOURCE menu | `0x0209` K_USB1 | selects USB1 and populates the browser |
 | **SoundSwitch** (note 34) | `0x0201` K_SOURCE | reopens the SOURCE menu at any time |
+| **SHIFT + SoundSwitch** | `0x8002` K_USBSTOP on USB manager ch 1+2, then a host eject | safe USB stop/eject; see [15](15-nh08s-power-and-eject.md) |
 
-Details and the measured state variables are in [10 — USB](10-usb.md).
+Details and the measured state variables are in [10 — USB](10-usb.md). The
+eject gesture and the power-button hook are in
+[15 — NH08S power and eject](15-nh08s-power-and-eject.md).
 
 Controls the SC Live 4 has that the RX3 does not (or vice versa):
 

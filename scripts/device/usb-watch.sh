@@ -28,6 +28,7 @@
 MNT=/media/usb1/sda1
 CH_MNT=/data/rbx3-run/media/usb1/sda1
 FIFO=/tmp/udev_usb1
+REQ=/tmp/usb-eject.req
 LOG=/data/usbwatch.log
 PIDFILE=/tmp/usbwatch.pid
 BUSES="${USBWATCH_BUSES:-1 2 3}"
@@ -174,6 +175,33 @@ run() {
   last_rbp=$(rbp_pid)
 
   while :; do
+    # SHIFT + SoundSwitch in rbp writes this request (rbp is chrooted and
+    # cannot exec /data/usb-eject.sh). Hand the watcher role over to the eject
+    # script, then exit: the script stops/restarts the watcher around the
+    # unmount so this loop cannot remount the stick mid-eject.
+    if [ -f "$REQ" ]; then
+      ts=""; mode=""
+      read -r ts mode < "$REQ" 2>/dev/null
+      now=$(date +%s)
+      rm -f "$REQ"
+      case "$ts" in
+        ''|*[!0-9]*)
+          log "eject: bad request '$ts $mode' -> ignored"
+          ts=0
+          ;;
+      esac
+      if [ $((now - ts)) -gt 15 ]; then
+        log "eject: stale request (ts=$ts mode=$mode) -> ignored"
+      elif [ ! -f /data/usb-eject.sh ]; then
+        log "eject: request ($mode) but /data/usb-eject.sh is missing"
+      else
+        log "eject: request ($mode) -> running /data/usb-eject.sh"
+        rm -f "$PIDFILE"
+        nohup setsid sh /data/usb-eject.sh >/dev/null 2>&1 &
+        exit 0
+      fi
+    fi
+
     dev=$(find_media_sd) || dev=""
     rbp=$(rbp_pid)
 
