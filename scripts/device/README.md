@@ -7,12 +7,15 @@ On-device scripts (ship to `/data/` on the SC Live 4 or Mixstream Pro / Pro Plus
 | `fix-dev.sh` | bind mounts (`/dev /proc /sys /tmp`), device stubs, `/tmp/udev_*` FIFOs, `etc/mtab` symlink. Run after every reboot. |
 | `start-rb.sh` | stop Engine OS + `edisksd`, prepare the chroot, select the JP21/NH08 audio layout from the device tree, start `edb_streamd` then `rbp`, start the USB watcher. |
 | `start-rbp-debug.sh` | same, but detached with `KNOB_VERBOSE=1` + `FBSHIM_DEBUG=1` and an `aseqdump` raw-MIDI capture; logs go to `/tmp/{knobshim,audioshim,seqdump}.log` and touch events to `/data/rbp-p.log`. Re-running restarts rbp. |
+| `start-rb-crashdiag.sh` | same as `start-rb.sh` but preloads `/usr/lib/crashcatch.so` and archives `/tmp/crash.log`, shim logs and `/data/rbp-p.log` into `/data/rbp-diag/<timestamp>/` when rbp exits. Keeps the power hook and `USBSTOP_*` support. Use for crash reproduction; do not leave installed as the default launcher. |
 | `stop-rbp` | stop rbp + `edb_streamd` + the USB watcher (panel keeps the last frame; Engine is **not** restarted). |
 | `stop-rbp-return-engine.sh` | `stop-rbp`, remove the runtime power-button drop-in, then `reset-failed` + start `engine.service` and the `edisksd`/`enginex-*` units. |
 | `usb-watch.sh` | hotplug either USB-A media port, mount + bind into the chroot as USB1 (`/media/usb1/sda1`), notify rbp via `/tmp/udev_usb1`; retries until rbp opens `export.pdb`. Also consumes `/tmp/usb-eject.req` and hands off to `usb-eject.sh`. |
 | `usb-eject.sh` | safe eject of **all** USB mass-storage `sdX` devices: stop the watcher, notify rbp, unmount (incl. the chroot bind), `sync`, sysfs `device/delete`, restart the watcher. `--shutdown` skips the restart. |
 | `rbp-shutdown.sh` | graceful teardown for the power hook: `stop-rbp`, `usb-eject.sh --shutdown`, release the chroot binds, `sync`. Never calls `poweroff`/`reboot`. |
 | `poweroff-hook.c` | builds `poweroff-hook.so` (armhf), `LD_PRELOAD`ed into `az01-pwrbtn`; runs `rbp-shutdown.sh` before the daemon's real `reboot()` syscall. |
+| `soundswitch-rbp.sh` | one-button rbp start: installed as the `soundswitch.service` `ExecStart` via a runtime drop-in recreated by the patched enginex boot hook, so the physical SoundSwitch button in Engine OS launches `start-rb.sh` without SSH. Logs to `/data/soundswitch-rbp.log`. |
+| `install-soundswitch-hook.sh` | idempotently patch `/data/enginex/bundle/boot-activate.sh` so it recreates the runtime `soundswitch.service` drop-in after every boot. Inserts the hook before the final Engine restart and relocates older EOF copies. Re-run after any enginex update/reinstall; respects `/data/soundswitch-rbp.disable`. |
 
 Source selection on the Mixstream (no hardware SOURCE button): push **Browse**
 with no source selected to open rbp's SOURCE menu, push again to select USB1;

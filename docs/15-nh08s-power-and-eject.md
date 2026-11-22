@@ -118,7 +118,8 @@ enumerated from scratch (`sda1` again, not a stale `sdb1`) and mounts as **USB
 calls libc `reboot(RB_POWER_OFF)`; it is *not* replaced. Disassembly of the
 stock binary shows it compares the press duration against `0x5B8D7F`
 (5,999,999 µs), so the button must be held for **about 6 seconds or longer**;
-we deliberately leave that timing unchanged.
+we deliberately leave that timing unchanged. A separate plan for a much shorter,
+tap-to-shutdown path in rbp is recorded in [section 8](#8-plan-1-s-graceful-shutdown-not-implemented).
 
 Instead, `start-rb.sh` installs a **runtime** drop-in (the root filesystem is
 read-only, so `/etc` cannot be changed):
@@ -185,6 +186,9 @@ ssh root@<device> 'chmod 755 /data/usb-eject.sh /data/rbp-shutdown.sh \
                              /data/poweroff-hook.so /data/timeout'
 ```
 
+For one-button start, also deploy `/data/soundswitch-rbp.sh` and install the
+boot hook as described in [section 4](#4-one-button-start-soundswitch--rbp).
+
 `start-rb.sh` also copies `/data/knobshim2.so` over the chroot copy, so the
 shim must be updated in both places: ship it in `work/rbx3-run.tgz` **and** as
 `/data/knobshim2.so`.
@@ -204,7 +208,110 @@ Handing the device back to Engine OS
 (`sh /data/stop-rbp-return-engine.sh`) removes the drop-in and restarts the
 power daemon without the preload.
 
-## 4. Verify
+## 4. One-button start (SoundSwitch → rbp)
+
+For SSH-free use, the stock `soundswitch.service` can be repurposed so the
+physical **SoundSwitch** button in Engine OS starts rbp instead. This was
+verified on the Mixstream Pro Plus: pressing SoundSwitch in Engine starts
+`soundswitch.service` and runs `/usr/SoundSwitch/Scripts/runSoundSwitch`.
+
+`/etc` cannot hold a drop-in on this firmware: root is dm-verity protected
+(`root=/dev/dm-0 ro`, `/sys/block/dm-0/ro = 1`), and even
+`mount -o remount,rw /` fails. The override is therefore a **runtime** drop-in:
+
+```
+/run/systemd/system/soundswitch.service.d/50-soundswitch-rbp.conf
+```
+
+```ini
+[Service]
+Type=simple
+ExecStart=
+ExecStart=/bin/sh /data/soundswitch-rbp.sh
+ExecStopPost=
+PIDFile=
+Restart=no
+TimeoutStopSec=30
+```
+
+* `ExecStart=` clears the original SoundSwitch launch.
+* `Type=simple` replaces `Type=forking`: `/data/start-rb.sh` stays in the
+  foreground while rbp is alive, so the service remains active for the whole
+  session and becomes inactive after `sh /data/stop-rbp`.
+* `PIDFile=` and `ExecStopPost=` are cleared because the old
+  `/tmp/soundswitch.pid` and cleanup script are no longer relevant.
+* `Restart=no` stops systemd from relaunching rbp after it exits.
+
+`/data/soundswitch-rbp.sh` logs the trigger to `/data/soundswitch-rbp.log` and
+`exec sh /data/start-rb.sh`. The original
+`/etc/systemd/system/soundswitch.service` is never edited.
+
+### Persistent boot hook
+
+Because `/run` is cleared at boot, `/data/install-soundswitch-hook.sh` inserts a
+marker-bounded block into `/data/enginex/bundle/boot-activate.sh`. That is the
+only writable boot activator found on this firmware, and it already recreates
+the other `/run/systemd/system/*.service.d` drop-ins. The added block checks
+that `/data/soundswitch-rbp.sh` exists, writes the runtime override, and runs
+`systemctl daemon-reload` on every full boot activation.
+
+The block must be placed **before** `boot-activate.sh`'s final
+`systemctl restart engine.service`. An earlier version appended it at EOF; on
+reboot that Engine restart terminated the activation process before the hook
+ran, so the runtime drop-in was missing and SoundSwitch opened the stock app.
+The helper now relocates old EOF copies to the correct position.
+
+The hook is guarded by `/data/soundswitch-rbp.disable`: when that file exists,
+the block removes the runtime drop-in and stock SoundSwitch behaviour is left
+alone.
+
+Install or refresh the hook:
+
+```sh
+scp scripts/device/install-soundswitch-hook.sh \
+    root@<device>:/data/install-soundswitch-hook.sh
+ssh root@<device> 'chmod 755 /data/install-soundswitch-hook.sh &&
+                   sh /data/install-soundswitch-hook.sh'
+```
+
+The helper is idempotent. Before changing `boot-activate.sh` it saves a
+timestamped copy as
+`/data/enginex/bundle/boot-activate.sh.pre-soundswitch-rbp.<YYYYmmddHHMMSS>`.
+It also applies the runtime drop-in immediately, so no reboot is needed.
+
+**After any enginex update or reinstall**, `boot-activate.sh` is replaced and
+the marker block is lost. Re-run:
+
+```sh
+sh /data/install-soundswitch-hook.sh
+```
+
+If enginex was reinstalled from scratch, re-copy `/data/soundswitch-rbp.sh`
+before running the helper. Verify with:
+
+```sh
+systemctl cat soundswitch.service
+systemctl show soundswitch.service -p Type -p ExecStart -p ExecStopPost \
+    -p PIDFile -p Restart -p TimeoutStopSec
+```
+
+Rollback:
+
+```sh
+touch /data/soundswitch-rbp.disable
+sh /data/install-soundswitch-hook.sh
+```
+
+That removes the runtime drop-in immediately and makes future boots skip it. To
+remove the boot-hook code itself, restore the saved `boot-activate.sh` backup
+(or delete the lines between `# >>> nh08s-one-button-rbp >>>` and
+`# <<< nh08s-one-button-rbp <<<`), then run `systemctl daemon-reload`.
+
+This is a deliberate replacement of the SoundSwitch shortcut/menu in Engine OS.
+Plain SoundSwitch **inside rbp** still maps to rbp's SOURCE key — only the
+Engine OS trigger is hijacked.
+
+## 5. Verify
 
 Ask before driving hardware tests. The safe order is:
 
@@ -221,7 +328,7 @@ Ask before driving hardware tests. The safe order is:
    dies, and the device powers off. On the next boot `/dev` is intact and no
    stale `/data/rbx3-run/*` mounts remain.
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -233,8 +340,15 @@ Ask before driving hardware tests. The safe order is:
 | Power button still hard-powers-off | hook not installed (missing `.so`/script, or daemon restart failed) | check `systemctl cat az01-power-button.service` for the drop-in, `/data/start-rb.log`, and `/data/rbp-shutdown.log` |
 | Power-button hook is active in Engine OS | `start-rb.sh` ran but Engine was restored without `stop-rbp-return-engine.sh` | run `sh /data/stop-rbp-return-engine.sh`, or remove `/run/systemd/system/az01-power-button.service.d` and restart the unit |
 | No `/data/rbp-shutdown.log` after pressing power | the daemon did not call libc `reboot()` (or the hook failed to load) | check `systemctl status az01-power-button.service` and the daemon environment; the raw-syscall fallback is a dedicated KEY_POWER listener |
+| SoundSwitch starts SoundSwitch instead of rbp | runtime drop-in missing, or the enginex boot hook was not reapplied | run `sh /data/install-soundswitch-hook.sh`; check `systemctl cat soundswitch.service` and `/data/soundswitch-rbp.log` |
+| SoundSwitch starts SoundSwitch again after an enginex update | the update replaced `boot-activate.sh` and removed the marker block | re-copy `scripts/device/install-soundswitch-hook.sh` if needed, then run `sh /data/install-soundswitch-hook.sh` |
+| SoundSwitch works until reboot, then opens the stock app again | the boot hook was appended after the final `systemctl restart engine.service` and never ran | re-run `sh /data/install-soundswitch-hook.sh`; it relocates the block before that restart |
+| SoundSwitch does nothing in Engine | the button did not call `soundswitch.service`, or `/data/soundswitch-rbp.disable` exists | check `journalctl -u soundswitch.service` and `ls -l /data/soundswitch-rbp.disable`; re-verify the trigger before changing the hook |
+| SoundSwitch stops responding after the app was stopped manually over SSH | Engine still believes the SoundSwitch backend is open | return to a clean Engine state with `sh /data/stop-rbp-return-engine.sh` (or restart `engine.service`), then press once again |
+| rbp starts but Wi-Fi/SSH disappears during the session | observed once after a fresh boot; cause not yet confirmed | rbp keeps running; hold power ~6 s for the normal graceful teardown and reboot, then inspect `/data/soundswitch-rbp.log`, `/data/start-rb.log` and `/data/rbp-shutdown.log` |
+| rbp exits/crashes during a test | no crash evidence is kept by the normal launcher; `/tmp` is tmpfs and shim logs are deleted on the next start | reproduce with `sh /data/start-rb-crashdiag.sh`, then inspect `/data/rbp-diag/<timestamp>/crash.log` and the archived shim/rbp logs; report before power-cycling |
 
-## 6. Files and logs
+## 7. Files and logs
 
 | Path | Role |
 |---|---|
@@ -246,3 +360,102 @@ Ask before driving hardware tests. The safe order is:
 | `/data/rbp-shutdown.log` | shutdown log |
 | `/data/poweroff-hook.so` | `reboot()` interposer preloaded into `az01-pwrbtn` |
 | `/run/systemd/system/az01-power-button.service.d/override.conf` | runtime drop-in (ephemeral) |
+| `/data/soundswitch-rbp.sh` | one-button start wrapper (`exec sh /data/start-rb.sh`) |
+| `/data/soundswitch-rbp.log` | log of SoundSwitch → rbp triggers |
+| `/data/install-soundswitch-hook.sh` | idempotent helper that patches the enginex boot activator and reapplies the runtime drop-in |
+| `/run/systemd/system/soundswitch.service.d/50-soundswitch-rbp.conf` | runtime drop-in that hijacks the Engine OS SoundSwitch trigger |
+| `/data/enginex/bundle/boot-activate.sh` | patched boot activator; marker `nh08s-one-button-rbp` recreates the drop-in each boot |
+| `/data/enginex/bundle/boot-activate.sh.pre-soundswitch-rbp.<timestamp>` | backup made before patching `boot-activate.sh` |
+| `/data/soundswitch-rbp.disable` | optional flag: skip/remove the one-button hook |
+| `/data/start-rb-crashdiag.sh` | diagnostic launcher: adds `crashcatch.so`, keeps the power hook and `USBSTOP_*`, archives logs to `/data/rbp-diag/<timestamp>/` |
+| `/data/rbp-diag/` | crash-diagnostic archives; `previous/` keeps the prior session's logs before the next start overwrites them |
+
+## 8. Plan: 1 s graceful shutdown (not implemented)
+
+Decision: while **rbp** is running, a brief power-button tap should start the
+existing graceful shutdown immediately. Engine OS keeps the stock ~6 s
+long-press. "Immediate" means the teardown starts within milliseconds; USB
+eject, unmount and `sync` still run before power is cut. Instant power-off
+without teardown is deliberately rejected.
+
+### Evidence
+
+`/dev/input/by-path/platform-gpio-keys-event` is a gpio-keys evdev device whose
+modalias contains `k74` (`KEY_POWER`). Disassembly of `/usr/bin/az01-pwrbtn`
+shows:
+
+1. it opens that evdev device and sets its timestamps to `CLOCK_MONOTONIC`;
+2. on a `KEY_POWER` press it stores the **event timestamp** as the start time;
+3. in its loop it calls `__clock_gettime64(CLOCK_MONOTONIC, ...)` for the
+   current time;
+4. it compares `now - start` with `0x5B8D7F` = **5,999,999 µs**;
+5. on timeout it calls `sync()` and `reboot(RB_POWER_OFF)`.
+
+The existing `poweroff-hook.so` already intercepts that `reboot()` and runs
+`/data/rbp-shutdown.sh` before the real raw reboot.
+
+### Proposed implementation
+
+Extend `scripts/device/poweroff-hook.c` with a second interposer:
+
+```c
+int __clock_gettime64(clockid_t clk, struct rbp_timespec64 *tp)
+{
+    int rc = real_clock_gettime64(clk, tp);
+
+    if (rc == 0 && clk == CLOCK_MONOTONIC &&
+        access("/data/power-immediate.disable", F_OK) != 0)
+        tp->tv_sec += 10;
+
+    return rc;
+}
+```
+
+`real_clock_gettime64` is resolved with `dlsym(RTLD_NEXT, "__clock_gettime64")`.
+On 32-bit ARM the time64 structure is **not** `struct timespec`: it is a 64-bit
+`tv_sec`, a 32-bit `tv_nsec` and 32 bits of padding, so a private matching
+structure must be used.
+
+Because the daemon takes the press-start time from the kernel event but the
+current time from libc, adding 10 s to libc's monotonic reading makes the very
+first elapsed-time check pass the stock 6 s threshold. The stock daemon then
+calls `reboot()` and our existing hook performs the normal graceful teardown.
+
+No `start-rb.sh` change is required: the hook is already only preloaded while
+rbp is running. `/data/power-immediate.disable` gives instant rollback.
+
+### Files to change
+
+* `scripts/device/poweroff-hook.c` — add the clock interposer and disable flag.
+* `scripts/device/README.md` — document the new hook behaviour.
+* `docs/15-nh08s-power-and-eject.md` — this section becomes the implementation
+  record.
+* `work/mixstream-pro-plus.patch` — regenerate and apply-check.
+
+### Deployment and verification
+
+1. Ask before deploying.
+2. Back up `/data/poweroff-hook.so`, rebuild with
+   `make -C scripts/device CROSS=arm-linux-gnueabihf- poweroff-hook.so`,
+   verify symbols/versions and hash, then copy it to `/data`.
+3. Restart only `az01-power-button.service` so the daemon maps the new `.so`.
+   No device reboot is needed.
+4. Check `systemctl cat az01-power-button.service` still shows the `LD_PRELOAD`
+   drop-in and `/proc/$(pgrep -x az01-pwrbtn)/maps` contains
+   `/data/poweroff-hook.so`.
+5. Ask before the hardware test. A short tap should produce a fresh
+   `=== shutdown requested ===` in `/data/rbp-shutdown.log` within milliseconds,
+   followed by the normal teardown and power-off. Inspect the log after the
+   device boots again.
+
+### Rollback and risk
+
+```sh
+touch /data/power-immediate.disable
+```
+
+The hook reads the flag on each clock call, so rollback takes effect
+immediately. If `dlsym` fails, the override returns the real time unchanged and
+the stock ~6 s long-press remains. Main risk: reliance on the daemon's imported
+glibc-internal `__clock_gettime64` symbol; the stock binary is fixed by
+dm-verity on this firmware, and failure is fail-safe.
