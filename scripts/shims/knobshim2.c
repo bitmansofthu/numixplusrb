@@ -1291,6 +1291,36 @@ static void handle_note(int ch, int note, int on)
           }
      }
 
+     /* NH08S SHIFT + CUE = rbp's TRACK SEARCH < (previous track / return to
+      * the start of the current track).  This is deck-scoped: use this deck's
+      * own SHIFT state, so ch2 controls deck 1 and ch3 controls deck 2 even
+      * when only one SHIFT is held.  Plain CUE keeps its normal K_CUE mapping.
+      * Mirror a real button: OP_PRESS on CUE note-on, OP_RELEASE on CUE
+      * note-off.  The latch keeps the release paired even if SHIFT is let go
+      * first.  An immediate synthetic press+release in one call was ignored. */
+     if (g_nh08s && deck_of_ch(ch) >= 0 && note == 9) {
+          static int cue_shift[2];
+          int d = deck_of_ch(ch);
+          if (on) {
+               if (shift_dn[d]) {
+                    if (!cue_shift[d]) {
+                         cue_shift[d] = 1;
+                         send_rx_key(K_TRREV, OP_PRESS, d + 1, 0);
+                         klog("knobshim2: deck%d shift+CUE -> TRREV 0x%04x press\n",
+                              d + 1, K_TRREV);
+                    }
+                    return;
+               }
+               cue_shift[d] = 0;   /* recover from a missed CUE note-off */
+          } else if (cue_shift[d]) {
+               cue_shift[d] = 0;
+               send_rx_key(K_TRREV, OP_RELEASE, d + 1, 0);
+               klog("knobshim2: deck%d shift+CUE -> TRREV 0x%04x release\n",
+                    d + 1, K_TRREV);
+               return;
+          }
+     }
+
      /* NH08S physical performance pads (notes 15..18).  There are only four
       * per deck, so SHIFT selects rbp's pads 5..8.  In HOT CUE mode the pad
       * keycode is unchanged; the per-deck 0x4103 SHIFT key sent by note 28

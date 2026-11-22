@@ -90,7 +90,7 @@ Read from `NH08S_Controller_Assignments.qml` and implemented in
 |---|---|---|
 | LOAD left / right | **note 1 / 2 on ch15** (measured; the QML nests Load in the deck block but the panel sends global ch15) | `0x4311` K_LOAD (deck 1 / 2) |
 | SYNC | note 8 | `0x4112` (hold → MASTER; **SHIFT + SYNC → `0x4111` K_MASTER**, toggles the sync master) |
-| CUE | note 9 | `0x4102` |
+| CUE | note 9 | `0x4102`; **SHIFT + CUE → `0x4215` K_TRREV** (previous track / back to track start), deck-scoped |
 | PLAY / PAUSE | note 10 | `0x4101` |
 | Pad mode 1 / 2 / 3 / 4 | notes 11 / 12 / 14 / 13 | `0x4113` HOT CUE, `0x4114` LOOPS, `0x4115` ROLL, `0x4116` BEAT JUMP |
 | Pads 1–4 | notes 15–18 | `0x4117`–`0x411a`; with SHIFT, pads 5–8 (`0x411b`–`0x411e`) except in HOT CUE mode (see below) |
@@ -99,7 +99,7 @@ Read from `NH08S_Controller_Assignments.qml` and implemented in
 | Jog touch | note 33 | `0x4306` |
 | Jog rotate | CC **`0x37` hi + `0x4D` lo** | `0x4305`; 1638 hardware counts/rev → **3600 rbp pulses/rev** (see below) |
 | Wheel | note 35 | `0x4104` VINYL (Shift: scratch) |
-| Shift | note 28 | modifier for SYNC / pitch bend / Wheel / FX select / pads; also gates Settings → SHORTCUT and VIEW → SEARCH. Sends rbp's internal `0x4103` on the deck channel (see pads below) |
+| Shift | note 28 | modifier for CUE / SYNC / pitch bend / Wheel / FX select / pads; also gates Settings → SHORTCUT and VIEW → SEARCH. Sends rbp's internal `0x4103` on the deck channel (see pads below) |
 | Pitch fader | CC `0x1F` + `0x4B` | `0x4109`; top = faster (**opposite of JP21**, whose QML has `invert: true`) |
 
 There is no key lock, slip, loop-in/out or censor button on the NH08S; those
