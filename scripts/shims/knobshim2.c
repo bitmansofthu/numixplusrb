@@ -808,24 +808,23 @@ static void set_fx_depth(void)
           klog("knobshim2: Beat FX depth -> 50%% (%d)\n", FX_DEPTH_10BIT);
 }
 
-/* NH08S deck FX paddles are momentary, but the RX3's FX ON key is a toggle
- * (the hardware button latches).  UiGetMixBeatFxOn() reads the ON bit from
- * rbp's UI state (g_ui -> [0x38] -> StatWatcher, pure memory reads), so the
- * shim can tell whether the effect is already on before toggling it. */
+/* NH08S deck FX paddles are spring-loaded, but they latch the Beat FX: one
+ * press toggles the effect on, the next toggles it off.  UiGetMixBeatFxOn()
+ * reads the ON bit from rbp's UI state (g_ui -> [0x38] -> StatWatcher, pure
+ * memory reads), so the shim can tell whether the effect is currently on. */
 #define ADDR_UI_MIX_BFX_ON 0x000fe46cUL
 static int bfx_is_on(void)
 {
      return ((int (*)(void))ADDR_UI_MIX_BFX_ON)() != 0;
 }
 
-/* set by the FX-assign knob or a deck paddle: stops the startup thread that
- * forces the Beat FX channel back to MASTER. */
+/* set by the FX-assign knob: stops the startup thread that forces the Beat FX
+ * channel back to MASTER. */
 static volatile int g_bfxch_user_set;
 
-/* per-deck paddle state: held, and whether the effect was already on when the
- * paddle went down (if it was, the release must not switch it off). */
+/* per-deck paddle state: set between the press and release so a repeated
+ * note-on while the paddle is held only toggles the effect once. */
 static int fx_paddle_down[2];
-static int fx_paddle_was_on[2];
 
 /* ---- NH08S pad layer ------------------------------------------------------
  * The Mixstream Pro Plus has only FOUR performance pads per deck, but rbp's
@@ -1321,34 +1320,25 @@ static void handle_note(int ch, int note, int on)
                }
                return;
           }
-          /* Deck FX paddle (ch4 = deck 1, ch5 = deck 2): momentary Beat FX.
-           * The paddle must NOT change the Beat FX channel any more; it only
-           * switches the currently selected effect on while held (and off
-           * again on release, unless it was already on before the press).
-           * The wet/dry level is still seeded because the Mixstream has no
-           * DEPTH knob. */
+          /* Deck FX paddle (ch4 = deck 1, ch5 = deck 2): latching Beat FX
+           * toggle.  Either paddle switches the currently selected effect on,
+           * and the next press switches it off; the release does nothing.
+           * The paddle must NOT change the Beat FX channel.  The wet/dry
+           * level is seeded only when switching the effect on, because the
+           * Mixstream has no DEPTH knob. */
           if ((ch == 4 || ch == 5) && note == 4) {
                int d = ch - 4;                   /* 0 = deck 1, 1 = deck 2 */
                if (on && !fx_paddle_down[d]) {
+                    int was_on = bfx_is_on();
                     fx_paddle_down[d] = 1;
-                    set_fx_depth();
-                    fx_paddle_was_on[d] = bfx_is_on();
-                    if (!fx_paddle_was_on[d]) {
-                         send_rx_key(K_BFX, OP_PRESS, CH_GLOBAL, 0);
-                         send_rx_key(K_BFX, OP_RELEASE, CH_GLOBAL, 0);
-                    }
-                    klog("knobshim2: deck %d FX paddle down -> fx %s (channel "
-                         "unchanged)\n", d + 1,
-                         fx_paddle_was_on[d] ? "already on" : "ON");
-               } else if (!on && fx_paddle_down[d]) {
+                    if (!was_on)
+                         set_fx_depth();
+                    send_rx_key(K_BFX, OP_PRESS, CH_GLOBAL, 0);
+                    send_rx_key(K_BFX, OP_RELEASE, CH_GLOBAL, 0);
+                    klog("knobshim2: deck %d FX paddle -> Beat FX %s "
+                         "(channel unchanged)\n", d + 1, was_on ? "OFF" : "ON");
+               } else if (!on) {
                     fx_paddle_down[d] = 0;
-                    int still_on = bfx_is_on();
-                    if (!fx_paddle_was_on[d]) {
-                         send_rx_key(K_BFX, OP_PRESS, CH_GLOBAL, 0);
-                         send_rx_key(K_BFX, OP_RELEASE, CH_GLOBAL, 0);
-                    }
-                    klog("knobshim2: deck %d FX paddle up -> fx %s (rbp state=%d)\n",
-                         d + 1, fx_paddle_was_on[d] ? "left on" : "OFF", still_on);
                }
                return;
           }

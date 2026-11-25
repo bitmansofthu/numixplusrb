@@ -218,8 +218,8 @@ selector, and **no LEVEL/DEPTH knob**:
 | SHIFT + 2 (FLANGER) | ch4 n1 | — | `0x4491` K_BEATNEXT — Beat FX beat **up** |
 | SHIFT + 3 (DELAY) | ch4 n2 | — | `0x448c` K_BFXCH = **0** — Beat FX to channel 1 (PLAYER_0) |
 | SHIFT + 4 (PHASER) | ch4 n3 | — | `0x448c` K_BFXCH = **1** — Beat FX to channel 2 (PLAYER_1) |
-| paddle deck 1 | ch4 n4 | — | momentary `0x448d` K_BFX (channel unchanged) |
-| paddle deck 2 | ch5 n4 | — | momentary `0x448d` K_BFX (channel unchanged) |
+| paddle deck 1 | ch4 n4 | — | toggle `0x448d` K_BFX: press = on, press again = off (channel unchanged) |
+| paddle deck 2 | ch5 n4 | — | toggle `0x448d` K_BFX: press = on, press again = off (channel unchanged) |
 
 `0x448b K_BFXTYPE` takes the **selector position**, not the internal effect
 type. Verified from rbp's `BeatEffectManager::storeMaxMinValue` jump table,
@@ -244,22 +244,24 @@ So the four NH08S buttons select Echo (pos 1), Flanger (pos 6), Delay
 (pos 0) and Trans (pos 9).
 
 Since there is no depth knob, `knobshim2.c` sends
-`0x448f K_DEPTH = 512/1023 (50 %)` at startup and again before every FX
-activation. Without that value rbp switches the effect on (the FX name turns
-blue on screen) but leaves it fully dry, so the audio does not change.
+`0x448f K_DEPTH = 512/1023 (50 %)` at startup and again whenever a paddle
+switches the effect on. Without that value rbp switches the effect on (the FX
+name turns blue on screen) but leaves it fully dry, so the audio does not
+change.
 
-**Momentary paddles.** The RX3 FX ON button latches, but the Mixstream paddle
-is spring-loaded, so `knobshim2.c` makes it momentary. The paddle does **not**
-change the Beat FX channel any more (the channel starts on **MASTER** and is
+**Latching paddles.** The RX3 FX ON button latches; the Mixstream paddle is
+spring-loaded, so `knobshim2.c` turns each press into a toggle. The paddle does
+**not** change the Beat FX channel (the channel starts on **MASTER** and is
 changed only with SHIFT + DELAY / PHASER):
 
-* pressing a paddle seeds `0x448f K_DEPTH = 512/1023 (50 %)`, then (if the
-  effect is off) a `K_BFX` press+release tap turns it **on**;
-* the matching release tap turns it **off** again.
+* one press switches the currently selected effect **on**, or **off** if it is
+  already on; the release does nothing, so pressing either paddle again
+  reverses it;
+* when switching it on, the press seeds `0x448f K_DEPTH = 512/1023 (50 %)`
+  first, then sends a `K_BFX` press+release tap;
 * `UiGetMixBeatFxOn()` (`rbp` `0x000fe46c`) reads the ON bit out of the UI
-  state so the shim knows whether the user had already latched the effect
-  (e.g. from the touch screen). If it was already on, the paddle leaves it on
-  at release instead of toggling it off.
+  state, so the toggle follows the live engine state, including changes made
+  on the touch screen;
 * the startup thread keeps re-sending `K_BFXCH = 5 (MASTER)` for the first
   ~3 s (rbp's mixer inits after the shim), so the default channel is MASTER.
 
