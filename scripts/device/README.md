@@ -8,11 +8,13 @@ On-device scripts (ship to `/data/` on the SC Live 4 or Mixstream Pro / Pro Plus
 | `start-rb.sh` | stop Engine OS + `edisksd`, prepare the chroot, select the JP21/NH08 audio layout from the device tree, start `edb_streamd` then `rbp`, start the USB watcher. |
 | `start-rbp-debug.sh` | same, but detached with `KNOB_VERBOSE=1` + `FBSHIM_DEBUG=1` and an `aseqdump` raw-MIDI capture; logs go to `/tmp/{knobshim,audioshim,seqdump}.log` and touch events to `/data/rbp-p.log`. Re-running restarts rbp. |
 | `start-rb-crashdiag.sh` | same as `start-rb.sh` but preloads `/usr/lib/crashcatch.so` and archives `/tmp/crash.log`, shim logs and `/data/rbp-p.log` into `/data/rbp-diag/<timestamp>/` when rbp exits. Keeps the power hook and `USBSTOP_*` support. Use for crash reproduction; do not leave installed as the default launcher. |
-| `stop-rbp` | stop rbp + `edb_streamd` + the USB watcher (panel keeps the last frame; Engine is **not** restarted). |
+| `start-rb-coredump.sh` | diagnostic launcher for real core dumps: enables `/data/coredumps.enabled`, does **not** preload `crashcatch.so` (its SIGSEGV handler would suppress the core), records rbp's exit status/signal, dmesg and the core paths in `/data/rbp-diag/<timestamp>/exit-status.txt`. Cores are written by the stock `az01-coredump` helper under `<media>/Engine Library/coredumps/` (or `/data/coredumps` without media). Removes the flag on exit; keeps the power hook and `USBSTOP_*`. Do not make it the default launcher. |
+| `stop-rbp` | stop rbp + `edb_streamd` + the USB watcher, closing an active recording first (panel keeps the last frame; Engine is **not** restarted). |
 | `stop-rbp-return-engine.sh` | `stop-rbp`, remove the runtime power-button drop-in, then `reset-failed` + start `engine.service` and the `edisksd`/`enginex-*` units. |
-| `usb-watch.sh` | hotplug either USB-A media port, mount + bind into the chroot as USB1 (`/media/usb1/sda1`), notify rbp via `/tmp/udev_usb1`; retries until rbp opens `export.pdb`. Also consumes `/tmp/usb-eject.req` and hands off to `usb-eject.sh`. |
-| `usb-eject.sh` | safe eject of **all** USB mass-storage `sdX` devices: stop the watcher, notify rbp, unmount (incl. the chroot bind), `sync`, sysfs `device/delete`, restart the watcher. `--shutdown` skips the restart. |
-| `rbp-shutdown.sh` | graceful teardown for the power hook: `stop-rbp`, `usb-eject.sh --shutdown`, release the chroot binds, `sync`. Never calls `poweroff`/`reboot`. |
+| `usb-watch.sh` | two-slot hotplug for USB sticks and the SD card: mount + bind into the chroot as USB1 (`/media/usb1/sda1`, stick) or USB2 (`/media/usb4/sda1`, SD preferred), publish `/tmp/usb-name-N` + `/tmp/usb-kind-N`, notify rbp via `/tmp/udev_usbN`; retries until rbp opens `export.pdb` for library media. Also consumes `/tmp/usb-eject.req` and hands off to `usb-eject.sh`. |
+| `usb-eject.sh` | safe eject of **all** removable media (`sdX` USB and `mmcblkX` SD): stop the watcher, stop recording, notify rbp on both FIFOs, unmount (incl. both chroot binds), `sync`, power-off/sysfs delete, hold SD cards in `/tmp/usb-held`, restart the watcher. `--shutdown` skips the restart. |
+| `rec-stop.sh` | host-side helper that asks the knobshim recorder to call `stopRecording()` via `/tmp/rec-stop.req` and waits for `/tmp/rec-stop.ack`. Called before every unmount/power teardown. |
+| `rbp-shutdown.sh` | graceful teardown for the power hook: `stop-rbp` (stops recording), `usb-eject.sh --shutdown`, release the chroot binds (USB1 + USB2), `sync`. Never calls `poweroff`/`reboot`. |
 | `poweroff-hook.c` | builds `poweroff-hook.so` (armhf), `LD_PRELOAD`ed into `az01-pwrbtn`; runs `rbp-shutdown.sh` before the daemon's real `reboot()` syscall. |
 | `soundswitch-rbp.sh` | one-button rbp start: installed as the `soundswitch.service` `ExecStart` via a runtime drop-in recreated by the patched enginex boot hook, so the physical SoundSwitch button in Engine OS launches `start-rb.sh` without SSH. Logs to `/data/soundswitch-rbp.log`. |
 | `install-soundswitch-hook.sh` | idempotently patch `/data/enginex/bundle/boot-activate.sh` so it recreates the runtime `soundswitch.service` drop-in after every boot. Inserts the hook before the final Engine restart and relocates older EOF copies. Re-run after any enginex update/reinstall; respects `/data/soundswitch-rbp.disable`. |
@@ -27,12 +29,13 @@ eject gesture. Implemented in `knobshim2.c`, see
 Also needed on the device:
 
 * `/data/timeout` — build it from [`timeout.c`](timeout.c) with
-  `make CROSS=arm-linux-gnueabihf-` in this directory; used by `usb-watch.sh`
-  and `usb-eject.sh` so a FIFO write to a dead rbp can never block.
-* `/data/usb-eject.sh`, `/data/rbp-shutdown.sh` and
-  `/data/poweroff-hook.so` — the eject/power helpers (not inside the chroot
-  tarball). `start-rb.sh` installs the runtime `az01-power-button.service`
-  drop-in only when these exist.
+  `make CROSS=arm-linux-gnueabihf-` in this directory; used by `usb-watch.sh`,
+  `rec-stop.sh` and `usb-eject.sh` so a FIFO write to a dead rbp can never
+  block.
+* `/data/usb-eject.sh`, `/data/rec-stop.sh`, `/data/rbp-shutdown.sh` and
+  `/data/poweroff-hook.so` — the eject/recording-stop/power helpers (not inside
+  the chroot tarball). `start-rb.sh` installs the runtime
+  `az01-power-button.service` drop-in only when these exist.
 * `/data/rbp-audio`, `/data/knobshim2.so`, `/data/audioshim.so`,
   `/data/fbshim-tsc.so`, `/data/libdirectfb_fbdev-rot16.so` — the runtime files
   `start-rb.sh` copies into the chroot (already baked into the chroot tarball).

@@ -71,6 +71,8 @@
  *                   NH08S 1638) - used for the rev/s speed value
  *   JOG_OUT_PPR=n   pulses per revolution sent to rbp (0 = same as JOG_PPR;
  *                   NH08S 3600 = rbp's JogPulse/SAMPLE_PER_PULSE scale)
+ *   (NH08S: SHIFT + right VINYL toggles master-mix recording to USB2; see
+ *    "master-mix recording" below.  No environment variable needed.)
  *   JOG_SPEED_GAIN=n  multiply the reported speed (default 1.0; NH08S 1.5)
  *   JOG_REV=1       reverse jog direction (default 0)
  *   JOG_IDLE_MS=n   ms of inactivity before a speed-0 jog key is sent
@@ -957,6 +959,277 @@ static void *usb_stop_thread(void *arg)
      return NULL;
 }
 
+/* ---- NH08S SHIFT + right VINYL: master-mix recording to USB2 ----------
+ *
+ * rbp's native REC key (0x0401) only arms when the USB2 device carries a
+ * rekordbox export, so the shim drives the mixer engine's recorder directly.
+ * MixerEngine owns a WavWriter at +84:
+ *   +149 = prepare accepted (directory present, >= 32 MB free)
+ *   +156 = recording active (set once the writer thread opened the file)
+ * prepare/start/stop only post messages to the writer thread, so every call
+ * is made from rec_thread and the result is polled.
+ *
+ * usb-watch.sh presents slot 2 as /media/usb4/sda1 and publishes
+ * /tmp/usb-name-2.  /tmp/rec-stop.req + /tmp/rec-stop.ack let the host close
+ * the file before an unmount or power cut.
+ */
+#define ME_PREPARE_REC 0x00057744UL
+#define ME_START_REC   0x00057754UL
+#define ME_STOP_REC    0x000577d4UL
+#define REC_DIR        "/media/usb4/sda1/PIONEER REC"
+#define REC_SLOT_FILE  "/tmp/usb-name-2"
+#define REC_KIND_FILE  "/tmp/usb-kind-2"
+#define REC_STOP_REQ   "/tmp/rec-stop.req"
+#define REC_STOP_ACK   "/tmp/rec-stop.ack"
+
+static volatile int rec_toggle_req = 0;
+static int rec_prepare_pending = 0;
+static unsigned long long rec_prepare_ms = 0;
+static int rec_start_pending = 0;
+static unsigned long long rec_start_ms = 0;
+static int rec_stop_on_start = 0;
+static int rec_stop_pending = 0;
+
+static void *rec_writer(void)
+{
+     void *engine = mixer_engine();
+     return engine ? *(void **)((char *)engine + 84) : NULL;
+}
+
+static int rec_active(void)
+{
+     void *w = rec_writer();
+     return w && *(volatile unsigned char *)((char *)w + 156);
+}
+
+static int rec_prepared(void)
+{
+     void *w = rec_writer();
+     return w && *(volatile unsigned char *)((char *)w + 149);
+}
+
+/* volume label published by the watcher; empty when there is none */
+static void rec_slot_label(char *buf, size_t n)
+{
+     int fd = real_open(REC_SLOT_FILE, O_RDONLY);
+     ssize_t r;
+
+     buf[0] = '\0';
+     if (fd < 0)
+          return;
+     r = real_read(fd, buf, n - 1);
+     real_close(fd);
+     if (r <= 0) {
+          buf[0] = '\0';
+          return;
+     }
+     buf[r] = '\0';
+     while (r > 0 && (buf[r - 1] == '\n' || buf[r - 1] == '\r' ||
+                      buf[r - 1] == ' '))
+          buf[--r] = '\0';
+}
+
+static const char *rec_kind(void)
+{
+     static char kind[16];
+     int fd = real_open(REC_KIND_FILE, O_RDONLY);
+     ssize_t r;
+
+     strcpy(kind, "?");
+     if (fd < 0)
+          return kind;
+     r = real_read(fd, kind, sizeof(kind) - 1);
+     real_close(fd);
+     if (r <= 0) {
+          strcpy(kind, "?");
+          return kind;
+     }
+     kind[r] = '\0';
+     while (r > 0 && (kind[r - 1] == '\n' || kind[r - 1] == '\r'))
+          kind[--r] = '\0';
+     return kind;
+}
+
+static void rec_ack(void)
+{
+     char buf[32];
+     int fd = real_open(REC_STOP_ACK, O_WRONLY | O_CREAT | O_TRUNC);
+     int n;
+
+     if (fd < 0)
+          return;
+     n = snprintf(buf, sizeof(buf), "%lu\n", (unsigned long)time(NULL));
+     if (n > 0)
+          (void)write(fd, buf, (size_t)n);
+     real_close(fd);
+}
+
+static void rec_request_toggle(void)
+{
+     rec_toggle_req = 1;
+}
+
+/* rec_thread: close the file for the host before a detach or power cut */
+static void rec_handle_stop_request(void)
+{
+     char buf[32];
+     int fd = real_open(REC_STOP_REQ, O_RDONLY);
+     ssize_t r;
+     unsigned long stamp, now = (unsigned long)time(NULL);
+
+     if (fd < 0)
+          return;
+     r = real_read(fd, buf, sizeof(buf) - 1);
+     real_close(fd);
+     if (r <= 0)
+          return;                 /* host is still writing the request */
+     buf[r] = '\0';
+     stamp = strtoul(buf, NULL, 10);
+     if (stamp == 0)
+          return;                 /* host is still writing the request */
+     if (now > stamp + 15) {
+          unlink(REC_STOP_REQ);   /* stale request: ignore like the eject path */
+          return;
+     }
+     rec_toggle_req = 0;          /* no new recording while the host ejects */
+     if (rec_prepare_pending) {
+          rec_prepare_pending = 0;
+          rec_stop_on_start = 0;
+     }
+     /* A start is already queued but +156 has not appeared yet.  Leave the
+      * request in place: rec_thread stops the writer as soon as it is active,
+      * and the ack is only written after +156 clears. */
+     if (rec_start_pending || rec_stop_on_start) {
+          rec_stop_on_start = 1;
+          return;
+     }
+     if (rec_active()) {
+          void *engine = mixer_engine();
+          if (!rec_stop_pending) {
+               if (engine)
+                    ((void (*)(void *))ME_STOP_REC)(engine);
+               rec_stop_pending = 1;
+          }
+          for (int i = 0; i < 50 && rec_active(); i++)
+               usleep(50000);
+          if (rec_active())
+               return;            /* still winding down: keep the request */
+     }
+     rec_stop_pending = 0;
+     unlink(REC_STOP_REQ);
+     rec_ack();
+     klog("knobshim2: recorder stopped for media detach\n");
+}
+
+static void rec_do_toggle(void)
+{
+     void *engine = mixer_engine();
+     char label[64];
+
+     if (!engine) {
+          klog("knobshim2: deck2 shift+VINYL -> REC NOT READY (no engine)\n");
+          return;
+     }
+     if (rec_active()) {
+          ((void (*)(void *))ME_STOP_REC)(engine);
+          rec_prepare_pending = 0;
+          rec_start_pending = 0;
+          rec_stop_on_start = 0;
+          rec_stop_pending = 1;
+          klog("knobshim2: deck2 shift+VINYL -> REC STOP\n");
+          return;
+     }
+     if (rec_stop_pending) {
+          klog("knobshim2: deck2 shift+VINYL -> REC BUSY (stopping)\n");
+          return;
+     }
+     if (rec_start_pending) {
+          rec_stop_on_start = 1;
+          klog("knobshim2: deck2 shift+VINYL -> REC STOP (start pending)\n");
+          return;
+     }
+     if (rec_prepare_pending) {
+          rec_prepare_pending = 0;
+          klog("knobshim2: deck2 shift+VINYL -> REC CANCEL (prepare pending)\n");
+          return;
+     }
+     if (access(REC_SLOT_FILE, F_OK) != 0) {
+          klog("knobshim2: deck2 shift+VINYL -> REC NOT READY (no USB2 media)\n");
+          return;
+     }
+     if (access(REC_DIR, F_OK) != 0 &&
+         mkdir(REC_DIR, 0777) != 0 && errno != EEXIST) {
+          klog("knobshim2: deck2 shift+VINYL -> REC NOT READY (mkdir %s: %s)\n",
+               REC_DIR, strerror(errno));
+          return;
+     }
+     {
+          void *w = rec_writer();
+          if (w)
+               *(volatile unsigned char *)((char *)w + 149) = 0;
+     }
+     rec_slot_label(label, sizeof(label));
+     ((void (*)(void *, const char *, int))ME_PREPARE_REC)(engine, REC_DIR, 0);
+     rec_prepare_pending = 1;
+     rec_prepare_ms = now_ms();
+     klog("knobshim2: deck2 shift+VINYL -> REC PREPARE (%s, %s label '%s')\n",
+          REC_DIR, rec_kind(), label);
+}
+
+static void *rec_thread(void *arg)
+{
+     (void)arg;
+     for (;;) {
+          usleep(100000);
+          rec_handle_stop_request();
+          if (rec_stop_pending && !rec_active())
+               rec_stop_pending = 0;
+          if (rec_toggle_req) {
+               rec_toggle_req = 0;
+               rec_do_toggle();
+          }
+          if (rec_prepare_pending) {
+               if (rec_active())
+                    rec_prepare_pending = 0;
+               else if (rec_prepared()) {
+                    void *engine = mixer_engine();
+                    rec_prepare_pending = 0;
+                    if (engine) {
+                         ((void (*)(void *))ME_START_REC)(engine);
+                         rec_start_pending = 1;
+                         rec_start_ms = now_ms();
+                    }
+               } else if (now_ms() - rec_prepare_ms > 3000ULL) {
+                    rec_prepare_pending = 0;
+                    klog("knobshim2: deck2 shift+VINYL -> REC NOT READY "
+                         "(prepare timeout)\n");
+               }
+          }
+          if (rec_start_pending) {
+               if (rec_active()) {
+                    rec_start_pending = 0;
+                    if (rec_stop_on_start) {
+                         void *engine = mixer_engine();
+                         rec_stop_on_start = 0;
+                         if (engine) {
+                              ((void (*)(void *))ME_STOP_REC)(engine);
+                              rec_stop_pending = 1;
+                         }
+                         klog("knobshim2: deck2 shift+VINYL -> REC STOP\n");
+                    } else {
+                         klog("knobshim2: deck2 shift+VINYL -> REC START\n");
+                    }
+               } else if (now_ms() - rec_start_ms > 3000ULL) {
+                    rec_start_pending = 0;
+                    rec_stop_on_start = 0;
+                    klog("knobshim2: deck2 shift+VINYL -> REC NOT READY "
+                         "(start timeout)\n");
+               }
+          }
+     }
+     return NULL;
+}
+
 static void handle_note(int ch, int note, int on)
 {
      /* SC Live 4 mixer PFL buttons (strips 1/2 = ch 0/1, note 13): toggle
@@ -1317,6 +1590,29 @@ static void handle_note(int ch, int note, int on)
                send_rx_key(K_TRREV, OP_RELEASE, d + 1, 0);
                klog("knobshim2: deck%d shift+CUE -> TRREV 0x%04x release\n",
                     d + 1, K_TRREV);
+               return;
+          }
+     }
+
+     /* NH08S SHIFT + right VINYL (deck 2 ch3 note 35) toggles master-mix
+      * recording to USB2.  Only the shifted gesture is swallowed; a plain
+      * VINYL press/release still reaches the K_VINYL mapping below, and the
+      * left deck is untouched.  The latch keeps the release paired even when
+      * SHIFT is let go first (same pattern as SHIFT+CUE). */
+     if (g_nh08s && deck_of_ch(ch) == 1 && note == 35) {
+          static int rec_shift[2];
+          int d = deck_of_ch(ch);
+          if (on) {
+               if (shift_dn[d]) {
+                    if (!rec_shift[d]) {
+                         rec_shift[d] = 1;
+                         rec_request_toggle();
+                    }
+                    return;
+               }
+               rec_shift[d] = 0;   /* recover from a missed note-off */
+          } else if (rec_shift[d]) {
+               rec_shift[d] = 0;
                return;
           }
      }
@@ -3497,5 +3793,7 @@ static void knobshim2_init(void)
      if (pthread_create(&tid, NULL, jog_idle_thread, NULL) == 0)
           pthread_detach(tid);
      if (pthread_create(&tid, NULL, usb_auto_thread, NULL) == 0)
+          pthread_detach(tid);
+     if (g_nh08s && pthread_create(&tid, NULL, rec_thread, NULL) == 0)
           pthread_detach(tid);
 }

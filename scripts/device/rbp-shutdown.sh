@@ -52,9 +52,9 @@ fi
 sh /data/usb-watch.sh stop >/dev/null 2>&1
 
 # Release the chroot binds so the next boot starts from a clean tree. The
-# media bind is handled by usb-eject.sh, but include it here for the case where
-# no USB device was present when the power button was pressed.
-for m in media/usb1/sda1 dev proc sys tmp; do
+# media binds are handled by usb-eject.sh, but include them here for the case
+# where no media was present when the power button was pressed.
+for m in media/usb1/sda1 media/usb4/sda1 dev proc sys tmp; do
   mp="/data/rbx3-run/$m"
   if mountpoint -q "$mp"; then
     log "unmount $mp"

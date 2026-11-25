@@ -1,20 +1,24 @@
 #!/bin/sh
 # =============================================================================
-# usb-watch.sh — SC Live 4 USB-A media port hotplug -> rbp (rekordbox player)
+# usb-watch.sh — two-slot USB/SD media watcher for rbp (rekordbox player)
 #
-# Adapted from PrimeBox. On the SC Live 4 the media USB-A port(s) enumerate on
+# Adapted from PrimeBox.  On the SC Live 4 the media USB-A port(s) enumerate on
 # the DWC OTG controller (usb1): a stick plugged in the back appears as
 #   /sys/block/sda -> .../platform/ff540000.usb/usb1/1-1/.../block/sda
-# (the control surface is a MIDI UART on card 0, NOT USB, so usb1 is free for
-# media).  usb2 (EHCI) / usb3 (OHCI) are watched too for the other ports.
+# usb2 (EHCI) / usb3 (OHCI) are watched too.  On the Mixstream Pro Plus the
+# SD slot enumerates as an mmcblk device whose /sys/block/<dev>/device/type is
+# "SD" (the internal eMMC reports "MMC" and is never touched).
 #
-# On attach (any mass-storage device appears on a watched controller):
-#   mount  /dev/sdX1 -> /media/usb1/sda1            (RX3-style vfat options)
-#   bind   /media/usb1/sda1 -> /data/rbx3-run/media/usb1/sda1  (chroot view)
-#   write  "mount /media/usb1/sda1" -> /tmp/udev_usb1          (rbp FIFO)
-# On detach:
-#   write  "umount /media/usb1/sda1" -> /tmp/udev_usb1
-#   umount -l both mounts
+# Slot policy: an SD card prefers slot 2, a USB stick prefers slot 1, and an
+# attached device keeps its slot until it is removed or ejected.  Slots:
+#
+#   slot 1  /dev/sdX1     -> /media/usb1/sda1   /tmp/udev_usb1  (library USB)
+#   slot 2  /dev/sdX1|mmcblkXpN -> /media/usb4/sda1  /tmp/udev_usb2  (SD)
+#
+# On attach: mount, bind into the chroot, publish /tmp/usb-name-N and
+# /tmp/usb-kind-N, then notify rbp.  Media with a rekordbox export is retried
+# until rbp opens export.pdb; plain media gets one umount/mount pair.
+# On detach: stop a recording on slot 2 first, notify rbp, then unmount.
 #
 # This mirrors the XDJ-RX3 udev rule 12-usb-memory-auto-mount.rules.
 # The mount event alone is sufficient — never write to /tmp/udev_usbctn*
@@ -25,10 +29,14 @@
 #         USBWATCH_POLL=1          (poll interval seconds)
 # =============================================================================
 
-MNT=/media/usb1/sda1
-CH_MNT=/data/rbx3-run/media/usb1/sda1
-FIFO=/tmp/udev_usb1
+S1_MNT=/media/usb1/sda1
+S1_CH=/data/rbx3-run/media/usb1/sda1
+S1_FIFO=/tmp/udev_usb1
+S2_MNT=/media/usb4/sda1
+S2_CH=/data/rbx3-run/media/usb4/sda1
+S2_FIFO=/tmp/udev_usb2
 REQ=/tmp/usb-eject.req
+HELD=/tmp/usb-held
 LOG=/data/usbwatch.log
 PIDFILE=/tmp/usbwatch.pid
 BUSES="${USBWATCH_BUSES:-1 2 3}"
@@ -37,148 +45,229 @@ TIMEOUT=/data/timeout
 
 log() { echo "$(date '+%F %T') $$ $*" >> "$LOG"; }
 
-# --- locate the sd block device of a USB mass-storage device ----------------
-find_media_sd() {
-  for blk in /sys/block/sd*; do
+slot_mnt() { [ "$1" = 1 ] && echo "$S1_MNT" || echo "$S2_MNT"; }
+slot_ch()  { [ "$1" = 1 ] && echo "$S1_CH"  || echo "$S2_CH"; }
+slot_fifo(){ [ "$1" = 1 ] && echo "$S1_FIFO" || echo "$S2_FIFO"; }
+
+# --- media discovery --------------------------------------------------------
+# Prints "<dev> <kind>" for each usable whole disk: USB mass storage on a
+# watched bus, or an mmcblk device whose type is SD (eMMC is "MMC").
+find_media() {
+  for blk in /sys/block/mmcblk* /sys/block/sd*; do
     [ -e "$blk" ] || continue
+    dev=${blk##*/}
+    case "$dev" in
+      mmcblk*)
+        type=$(cat "$blk/device/type" 2>/dev/null)
+        [ "$type" = "SD" ] || continue
+        echo "$dev sd"
+        continue
+        ;;
+    esac
     tgt=$(readlink "$blk" 2>/dev/null) || continue
     for b in $BUSES; do
       case "$tgt" in
-        *"/usb$b/"*) echo "${blk##*/}"; return 0 ;;
+        *"/usb$b/"*) echo "$dev usb"; break ;;
       esac
     done
   done
-  return 1
+}
+
+is_held() {
+  [ -f "$HELD" ] || return 1
+  grep -qx "$1" "$HELD" 2>/dev/null
+}
+
+# Drop hold entries whose block device is gone, so reinsertion works again.
+prune_held() {
+  [ -f "$HELD" ] || return 0
+  tmp="$HELD.$$"
+  : > "$tmp"
+  while read -r d; do
+    [ -n "$d" ] || continue
+    [ -e "/sys/block/$d" ] || continue
+    echo "$d" >> "$tmp"
+  done < "$HELD"
+  mv "$tmp" "$HELD"
 }
 
 # --- wait for the first partition; fall back to whole-disk filesystem ------
 find_partition() {
   dev=$1
+  case "$dev" in
+    mmcblk*) cand="${dev}p1" ;;
+    *)       cand="${dev}1" ;;
+  esac
   i=0
   while [ $i -lt 40 ]; do                 # up to 4 s (0.1 s steps)
-    [ -b "/dev/${dev}1" ] && { echo "${dev}1"; return 0; }
+    [ -b "/dev/$cand" ] && { echo "$cand"; return 0; }
     i=$((i + 1)); sleep 0.1
   done
   if blkid "/dev/$dev" >/dev/null 2>&1; then echo "$dev"; return 0; fi
   return 1
 }
 
-# --- tell rbp about a USB event (FIFO; rbp keeps it open O_RDWR) -----------
+# --- tell rbp about a media event (FIFO; rbp keeps it open O_RDWR) ---------
 notify() {
-  msg=$1
-  if [ ! -p "$FIFO" ]; then
-    log "notify: $FIFO missing (rbp down?) — skipping"
+  slot=$1
+  msg=$2
+  fifo=$(slot_fifo "$slot")
+  if [ ! -p "$fifo" ]; then
+    log "notify: $fifo missing (rbp down?) — skipping"
     return 1
   fi
-  if "$TIMEOUT" 3 sh -c 'printf "%s" "$1" > "$2"' sh "$msg" "$FIFO" 2>/dev/null; then
-    log "notify: $msg"
+  if "$TIMEOUT" 3 sh -c 'printf "%s" "$1" > "$2"' sh "$msg" "$fifo" 2>/dev/null; then
+    log "notify: slot$slot $msg"
     return 0
   fi
-  log "notify: FAILED to write '$msg' (rbp down?)"
+  log "notify: FAILED to write '$msg' to $fifo (rbp down?)"
   return 1
 }
 
 # --- send umount+then mount, retrying until rbp opens the DB ---------------
 # rbp's DeviceSQL channel takes several seconds to come up after a (re)start;
-# a mount event sent before that is silently lost. Keep re-notifying until
-# rbp actually opens export.pdb (the analysis has started).
+# a mount event sent before that is silently lost.
 notify_mount_until_open() {
+  slot=$1
+  mnt=$(slot_mnt "$slot")
+  if [ -z "$(rbp_pid)" ]; then
+    log "attach: slot$slot rbp not running -> defer notification"
+    return 1
+  fi
   n=0
   while [ $n -lt 12 ]; do
     sleep 4
-    notify "umount $MNT"
+    notify "$slot" "umount $mnt"
     sleep 0.3
-    notify "mount $MNT"
+    notify "$slot" "mount $mnt"
     sleep 4
     rbp=$(rbp_pid)
     if [ -n "$rbp" ] && ls -l /proc/$rbp/fd 2>/dev/null | grep -q "export.pdb"; then
-      log "attach: rbp opened export.pdb (notify attempt $n)"
+      log "attach: slot$slot rbp opened export.pdb (attempt $n)"
       return 0
     fi
     n=$((n + 1))
   done
-  log "attach: rbp never opened export.pdb after retries"
+  log "attach: slot$slot rbp never opened export.pdb after retries"
   return 1
 }
 
 # --- mount + chroot bind + notify ------------------------------------------
 attach() {
-  dev=$1
+  slot=$1
+  dev=$2
+  kind=$3
+  mnt=$(slot_mnt "$slot")
+  chm=$(slot_ch "$slot")
   part=$(find_partition "$dev") || { log "attach: no usable partition on $dev"; return 1; }
 
   src=""
-  if mountpoint -q "$MNT"; then
-    src=$(awk -v m="$MNT" '$2 == m { print $1; exit }' /proc/mounts)
+  if mountpoint -q "$mnt"; then
+    src=$(awk -v m="$mnt" '$2 == m { print $1; exit }' /proc/mounts)
   fi
   if [ "$src" = "/dev/$part" ]; then
-    log "attach: $MNT already mounted from /dev/$part (refreshing bind only)"
+    log "attach: slot$slot $mnt already mounted from /dev/$part (refreshing bind only)"
   else
-    # A pulled stick, or a watcher restart, can leave $MNT pointing at a
+    # A pulled device, or a watcher restart, can leave $mnt pointing at a
     # device that is gone (sda1) while the new one enumerated as sdb1.
-    # Mounting over it would keep rbp reading the dead tree, so drop the
-    # stale mount first (lazy: rbp may still hold a directory handle).
     if [ -n "$src" ]; then
-      log "attach: $MNT is stale ($src, want /dev/$part) -> remounting"
-      if mountpoint -q "$CH_MNT"; then umount -l "$CH_MNT" 2>/dev/null; fi
-      umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null
+      log "attach: slot$slot $mnt is stale ($src, want /dev/$part) -> remounting"
+      if mountpoint -q "$chm"; then umount -l "$chm" 2>/dev/null; fi
+      umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null
     fi
     fstype=$(blkid -s TYPE -o value "/dev/$part" 2>/dev/null)
     [ -n "$fstype" ] || fstype=vfat
-    mkdir -p "$MNT"
+    mkdir -p "$mnt"
     case "$fstype" in
-      vfat)    mount -t vfat -o flush,rw,noatime,shortname=mixed,dmask=000,fmask=000,codepage=437,iocharset=iso8859-1,usefree,utf8 "/dev/$part" "$MNT" ;;
-      exfat)   mount -t exfat -o rw,noatime "/dev/$part" "$MNT" ;;
-      hfsplus) mount -t hfsplus -o force,rw,noatime "/dev/$part" "$MNT" ;;
-      *)       mount "/dev/$part" "$MNT" ;;
+      vfat)    mount -t vfat -o flush,rw,noatime,shortname=mixed,dmask=000,fmask=000,codepage=437,iocharset=iso8859-1,usefree,utf8 "/dev/$part" "$mnt" ;;
+      exfat)   mount -t exfat -o rw,noatime "/dev/$part" "$mnt" ;;
+      hfsplus) mount -t hfsplus -o force,rw,noatime "/dev/$part" "$mnt" ;;
+      *)       mount "/dev/$part" "$mnt" ;;
     esac
     rc=$?
     if [ $rc -ne 0 ]; then
-      log "attach: mount /dev/$part -> $MNT failed rc=$rc"
+      log "attach: slot$slot mount /dev/$part -> $mnt failed rc=$rc"
       return 1
     fi
-    log "attach: mounted /dev/$part ($fstype) -> $MNT"
+    log "attach: slot$slot mounted /dev/$part ($fstype, $kind) -> $mnt"
   fi
 
-  mkdir -p "$CH_MNT"
-  if ! mountpoint -q "$CH_MNT"; then
-    if ! mount --bind "$MNT" "$CH_MNT"; then
-      log "attach: chroot bind $MNT -> $CH_MNT failed"
+  mkdir -p "$chm"
+  if ! mountpoint -q "$chm"; then
+    if ! mount --bind "$mnt" "$chm"; then
+      log "attach: slot$slot chroot bind $mnt -> $chm failed"
       return 1
     fi
-    log "attach: chroot bind ok ($CH_MNT)"
+    log "attach: slot$slot chroot bind ok ($chm)"
   fi
 
-  # bind must exist BEFORE rbp checks the stick's files (export.pdb etc.).
-  # Reset PathDecider state with umount first, then send the native mount
-  # notification, retrying until rbp opens the DB (its DeviceSQL channel needs
-  # time to come up after a restart).
-  notify_mount_until_open
+  # Markers are the shim's only readiness check for recording.
+  label=$("$TIMEOUT" 2 blkid -s LABEL -o value "/dev/$part" 2>/dev/null)
+  printf '%s\n' "$label" > "/tmp/usb-name-$slot"
+  printf '%s\n' "$kind" > "/tmp/usb-kind-$slot"
+  log "attach: slot$slot marker label='$label' kind=$kind"
+
+  # The bind must exist BEFORE rbp checks the files (export.pdb etc.).
+  if [ -f "$mnt/PIONEER/rekordbox/export.pdb" ]; then
+    notify_mount_until_open "$slot"
+  else
+    # Plain media (SD card): one pair is enough; do not stall the loop.
+    notify "$slot" "umount $mnt"
+    sleep 0.3
+    notify "$slot" "mount $mnt"
+  fi
   return 0
 }
 
-# --- notify rbp + release mounts ---------------------------------------------
+# --- stop a slot-2 recording, notify rbp, release mounts -------------------
 detach() {
-  log "detach: notifying rbp"
-  notify "umount $MNT"
+  slot=$1
+  mnt=$(slot_mnt "$slot")
+  chm=$(slot_ch "$slot")
+
+  if [ "$slot" = 2 ] && [ -x /data/rec-stop.sh ]; then
+    log "detach: slot2 asking rec-stop.sh to close the recording"
+    sh /data/rec-stop.sh >> "$LOG" 2>&1
+  fi
+  log "detach: slot$slot notifying rbp"
+  notify "$slot" "umount $mnt"
   sleep 1
-  if mountpoint -q "$CH_MNT"; then umount -l "$CH_MNT"; log "detach: umount -l $CH_MNT"; fi
-  if mountpoint -q "$MNT";    then umount -l "$MNT";    log "detach: umount -l $MNT";    fi
-  rmdir "$CH_MNT" 2>/dev/null
-  rmdir "$MNT" 2>/dev/null
+  if mountpoint -q "$chm"; then umount -l "$chm"; log "detach: slot$slot umount -l $chm"; fi
+  if mountpoint -q "$mnt"; then umount -l "$mnt"; log "detach: slot$slot umount -l $mnt"; fi
+  rmdir "$chm" 2>/dev/null
+  rmdir "$mnt" 2>/dev/null
+  rm -f "/tmp/usb-name-$slot" "/tmp/usb-kind-$slot"
 }
 
 rbp_pid() { ps -e -o pid,args | awk '/\/root\/pdj\/rbp/ && !/sh -c/ && !/strace/ && !/awk/ {print $1; exit}'; }
 
+# rbp restarted: a library stick needs the retry-until-export.pdb-open loop;
+# plain media (SD) only needs one umount/mount pair, so never stall the loop.
+renotify() {
+  slot=$1
+  mnt=$(slot_mnt "$slot")
+  if [ -f "$mnt/PIONEER/rekordbox/export.pdb" ]; then
+    notify_mount_until_open "$slot"
+  else
+    notify "$slot" "umount $mnt"
+    sleep 0.3
+    notify "$slot" "mount $mnt"
+  fi
+}
+
 run() {
   log "=== usb-watch run: watching buses [$BUSES], poll ${POLL}s ==="
-  cur=""
+  slot_dev1=""
+  slot_dev2=""
+  slot_kind1=""
+  slot_kind2=""
   last_rbp=$(rbp_pid)
 
   while :; do
     # SHIFT + SoundSwitch in rbp writes this request (rbp is chrooted and
     # cannot exec /data/usb-eject.sh). Hand the watcher role over to the eject
     # script, then exit: the script stops/restarts the watcher around the
-    # unmount so this loop cannot remount the stick mid-eject.
+    # unmount so this loop cannot remount the media mid-eject.
     if [ -f "$REQ" ]; then
       ts=""; mode=""
       read -r ts mode < "$REQ" 2>/dev/null
@@ -202,33 +291,72 @@ run() {
       fi
     fi
 
-    dev=$(find_media_sd) || dev=""
-    rbp=$(rbp_pid)
+    prune_held
 
-    if [ -n "$dev" ]; then
-      if [ "$dev" != "$cur" ]; then
-        [ -n "$cur" ] && detach
-        log "attach: detected $dev on watched port"
-        if attach "$dev"; then
-          cur=$dev
-        else
-          cur=""
-        fi
-      elif [ -n "$rbp" ] && [ "$rbp" != "$last_rbp" ]; then
-        log "attach: rbp restarted ($last_rbp -> $rbp), re-notifying mount"
-        notify_mount_until_open
-      fi
-    else
-      if [ -n "$cur" ]; then
-        detach
-        cur=""
-      elif mountpoint -q "$MNT"; then
-        # No media device on the watched buses but something is still
-        # mounted: the stick was pulled while the watcher was down.
-        log "detach: stale $MNT with no media device"
-        detach
-      fi
+    # Drop slots whose device disappeared, then (re)assign the rest.
+    if [ -n "$slot_dev1" ] && [ ! -e "/sys/block/$slot_dev1" ]; then
+      log "detach: slot1 device $slot_dev1 disappeared"
+      detach 1
+      slot_dev1=""; slot_kind1=""
     fi
+    if [ -n "$slot_dev2" ] && [ ! -e "/sys/block/$slot_dev2" ]; then
+      log "detach: slot2 device $slot_dev2 disappeared"
+      detach 2
+      slot_dev2=""; slot_kind2=""
+    fi
+
+    find_media > /tmp/usbwatch.media.$$
+    while read -r dev kind; do
+      [ -n "$dev" ] || continue
+      if [ "$dev" = "$slot_dev1" ] || [ "$dev" = "$slot_dev2" ]; then
+        continue
+      fi
+      if is_held "$dev"; then
+        continue
+      fi
+      if [ "$kind" = "sd" ]; then
+        pref=2; alt=1
+      else
+        pref=1; alt=2
+      fi
+      if [ "$pref" = 1 ] && [ -z "$slot_dev1" ]; then
+        slot=1
+      elif [ "$pref" = 2 ] && [ -z "$slot_dev2" ]; then
+        slot=2
+      elif [ "$alt" = 1 ] && [ -z "$slot_dev1" ]; then
+        slot=1
+      elif [ "$alt" = 2 ] && [ -z "$slot_dev2" ]; then
+        slot=2
+      else
+        log "attach: $dev ($kind) has no free slot -> waiting"
+        continue
+      fi
+      log "attach: detected $dev ($kind) on watched port -> slot$slot"
+      if attach "$slot" "$dev" "$kind"; then
+        if [ "$slot" = 1 ]; then slot_dev1=$dev; slot_kind1=$kind
+        else slot_dev2=$dev; slot_kind2=$kind; fi
+      fi
+    done < /tmp/usbwatch.media.$$
+    rm -f /tmp/usbwatch.media.$$
+
+    rbp=$(rbp_pid)
+    if [ -n "$rbp" ] && [ "$rbp" != "$last_rbp" ]; then
+      log "attach: rbp restarted ($last_rbp -> $rbp), re-notifying mounts"
+      [ -n "$slot_dev1" ] && renotify 1
+      [ -n "$slot_dev2" ] && renotify 2
+    fi
+
+    # No media on the watched buses but something is still mounted: the
+    # device was pulled while the watcher was down.
+    if [ -z "$slot_dev1" ] && mountpoint -q "$S1_MNT"; then
+      log "detach: stale $S1_MNT with no media device"
+      detach 1
+    fi
+    if [ -z "$slot_dev2" ] && mountpoint -q "$S2_MNT"; then
+      log "detach: stale $S2_MNT with no media device"
+      detach 2
+    fi
+
     last_rbp=$rbp
     sleep "$POLL"
   done
@@ -258,9 +386,11 @@ stop() {
 
 status() {
   echo "pid: $(cat "$PIDFILE" 2>/dev/null || echo none)"
-  echo "media sd: $(find_media_sd || echo none)"
-  echo "mounted: $(mountpoint -q "$MNT" && echo yes || echo no)"
-  echo "chroot bind: $(mountpoint -q "$CH_MNT" && echo yes || echo no)"
+  echo "media: $(find_media | tr '\n' ' ')"
+  echo "slot1 $S1_MNT: mounted $(mountpoint -q "$S1_MNT" && echo yes || echo no), bind $(mountpoint -q "$S1_CH" && echo yes || echo no), label '$(cat /tmp/usb-name-1 2>/dev/null)'"
+  echo "slot2 $S2_MNT: mounted $(mountpoint -q "$S2_MNT" && echo yes || echo no), bind $(mountpoint -q "$S2_CH" && echo yes || echo no), label '$(cat /tmp/usb-name-2 2>/dev/null)'"
+  held=$( [ -f "$HELD" ] && tr '\n' ' ' < "$HELD" )
+  echo "held: $held"
   echo "--- log tail ---"
   tail -15 "$LOG" 2>/dev/null
 }

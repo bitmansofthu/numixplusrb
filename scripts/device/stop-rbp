@@ -5,6 +5,12 @@
 
 sh /data/usb-watch.sh stop 2>/dev/null
 
+# Close an active master-mix recording before rbp (and its writer thread) is
+# killed, so REC###.WAV is finalised instead of leaving RECTMP.WAV behind.
+if [ -x /data/rec-stop.sh ]; then
+  sh /data/rec-stop.sh 2>/dev/null
+fi
+
 # Matches the loader's process name, which both rbp and edb_streamd use.
 # Do not use "pkill -f": it also matches an SSH shell running this command.
 pkill -9 ld-linux.so.3 2>/dev/null

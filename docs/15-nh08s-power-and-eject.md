@@ -1,12 +1,12 @@
-# 15 — NH08S safe USB eject and power-button shutdown
+# 15 — NH08S safe media eject and power-button shutdown
 
-Two NH08S-specific gestures make USB media and power-off safe while rbp is
+Two NH08S-specific gestures make USB/SD media and power-off safe while rbp is
 driving the hardware:
 
 | Gesture | Effect |
 |---|---|
-| **SHIFT + SoundSwitch** (the printed *lighting* button, ch15 note 34) | rbp's native USB stop on both USB manager channels, then unmount + remove every USB mass-storage drive |
-| **Power button** | stop rbp/`edb_streamd`, eject USB media, release the chroot binds, `sync`, then power off — using the stock `az01-power-button.service` timing |
+| **SHIFT + SoundSwitch** (the printed *lighting* button, ch15 note 34) | rbp's native USB stop on both USB manager channels, stop an active recording, then unmount + release every removable media device (USB sticks and SD) |
+| **Power button** | stop rbp/`edb_streamd`, close a recording, eject media, release the chroot binds, `sync`, then power off — using the stock `az01-power-button.service` timing |
 
 Plain **SoundSwitch** keeps its existing rbp `SOURCE` behaviour
 ([10](10-usb.md)); only the SHIFT-qualified press ejects.
@@ -20,7 +20,9 @@ short press does nothing.
 The implementation lives in:
 
 * `scripts/shims/knobshim2.c` — gesture, native keycode, request mailbox.
-* `scripts/device/usb-eject.sh` — OS-level unmount + device removal.
+* `scripts/device/usb-watch.sh` — two-slot watcher; consumes the eject request.
+* `scripts/device/usb-eject.sh` — OS-level unmount + device release.
+* `scripts/device/rec-stop.sh` — closes an active recording before unmount.
 * `scripts/device/rbp-shutdown.sh` — graceful teardown for the power hook.
 * `scripts/device/poweroff-hook.c` → `poweroff-hook.so` — `reboot()` interposer.
 * `scripts/device/start-rb.sh` — installs the runtime power-button drop-in.
@@ -67,9 +69,9 @@ therefore writes a one-line request to the bind-mounted host `/tmp`:
 
 `usb-watch.sh` polls the host `/tmp` once a second. When it sees the request it
 
-1. drops requests older than **15 s** or with a malformed timestamp,
+1. Drops requests older than **15 s** or with a malformed timestamp,
 2. removes its PID file and **exits** (so its 1 s loop cannot remount the
-   stick during the eject),
+   media during the eject),
 3. starts `usb-eject.sh` detached with `setsid`.
 
 ```
@@ -85,31 +87,42 @@ SHIFT+n34 → knobshim2 → rbp 0x8002 ch1+ch2
 
 1. Takes a PID-checked lock (`/tmp/usb-eject.lock.d`) so a double press only
    runs one eject.
-2. Discovers **all** `/sys/block/sd*` whose sysfs path contains `/usb` — every
-   USB mass-storage device, not only `sda1`. The `removable` flag is not used:
-   USB-SATA bridges report `0` but are still external media.
+2. Discovers every removable device: all `/sys/block/sd*` whose sysfs path
+   contains `/usb`, plus every `mmcblk*` whose
+   `/sys/block/<dev>/device/type` is `SD`. The `removable` flag is not used:
+   USB-SATA bridges report `0` but are still external media, and the internal
+   eMMC reports `MMC` so it is never touched. Devices backing `/` or `/data`
+   are skipped.
 3. `sh /data/usb-watch.sh stop` (normally a no-op: the watcher exited already).
-4. Notifies rbp `umount /media/usb1/sda1` through `/tmp/udev_usb1` so its
-   `PathDecider` state is reset. A missing reader is skipped (shutdown path);
-   the static `/data/timeout` helper bounds the FIFO open.
-5. `sync`, unmounts the chroot bind `/data/rbx3-run/media/usb1/sda1` and every
-   mountpoint backed by `/dev/sdX*`, with a lazy fallback.
-6. For each device: `udisksctl power-off -b /dev/sdX` if the tool exists (it
+4. Closes an active recording with `sh /data/rec-stop.sh` while the filesystem
+   is still writable, so `RECTMP.WAV` is renamed to `REC###.WAV`.
+5. Notifies rbp `umount …` through **both** `/tmp/udev_usb1` and
+   `/tmp/udev_usb2` so its `PathDecider` state is reset. A missing reader is
+   skipped (shutdown path); the static `/data/timeout` helper bounds the FIFO
+   open.
+6. `sync`, unmounts both chroot binds (`media/usb1/sda1`, `media/usb4/sda1`)
+   and every mountpoint backed by the device, with a lazy fallback.
+7. For each device: `udisksctl power-off -b /dev/sdX` if the tool exists (it
    does not on this firmware), then the primary path
    `echo 1 > /sys/block/sdX/device/delete`, waiting up to 3 s for the device to
-   disappear.
-7. Restarts `usb-watch.sh` (unless called with `--shutdown`).
+   disappear. An SD card has no `device/delete` node; unmount + `sync` is
+   logged as safe to remove.
+8. Records each device in `/tmp/usb-held` so the restarted watcher does not
+   remount a card that is still sitting in the slot. Entries are pruned once
+   the block device disappears.
+9. Restarts `usb-watch.sh` (unless called with `--shutdown`).
 
 Logs: `/data/usb-eject.log` (full detail) and `/tmp/knobshim.log` (one-line
-result). With no stick attached the gesture is a logged no-op.
+result). With no media attached the gesture is a logged no-op.
 
 ### Reinsertion
 
 `device/delete` removes the kernel's SCSI device, so the next insertion is
 enumerated from scratch (`sda1` again, not a stale `sdb1`) and mounts as **USB
-1** without restarting rbp. If it does not appear, check
-`/data/usb-eject.log` for an unmount failure and re-run
-`sh /data/usb-watch.sh start`.
+1** without restarting rbp. An ejected SD card stays held until it is pulled
+and reinserted (the hold entry is pruned when `/sys/block/mmcblkX` is gone). If
+media does not appear, check `/data/usb-eject.log` for an unmount failure and
+re-run `sh /data/usb-watch.sh start`.
 
 ## 2. Power button
 
@@ -149,10 +162,13 @@ restarted clean so the power button never stops working.
 
 1. logs to `/data/rbp-shutdown.log`; serialises repeated presses with
    `/tmp/rbp-shutdown.lock.d`;
-2. `sh /data/stop-rbp` (stops the USB watcher, rbp, `edb_streamd`, capture);
-3. `sh /data/usb-eject.sh --shutdown` (unmount + remove USB, **no** watcher
-   restart);
-4. unmounts `/data/rbx3-run/{media/usb1/sda1,dev,proc,sys,tmp}` and `sync`;
+2. `sh /data/stop-rbp` (stops the USB watcher, closes an active recording,
+   stops rbp and `edb_streamd`, ends the capture);
+3. `sh /data/usb-eject.sh --shutdown` (closes any recording again, unmounts and
+   releases USB/SD media, **no** watcher restart);
+4. unmounts
+   `/data/rbx3-run/{media/usb1/sda1,media/usb4/sda1,dev,proc,sys,tmp}` and
+   `sync`;
 5. **never** calls `poweroff`/`reboot` itself — the hook does that after the
    script returns.
 
@@ -177,13 +193,18 @@ Deploy the device scripts next to `start-rb.sh` (they are not inside
 
 ```sh
 scp scripts/shims/knobshim2.so \
+    scripts/device/usb-watch.sh \
     scripts/device/usb-eject.sh \
+    scripts/device/rec-stop.sh \
+    scripts/device/stop-rbp \
     scripts/device/rbp-shutdown.sh \
     scripts/device/poweroff-hook.so \
     scripts/device/timeout \
     root@<device>:/data/
-ssh root@<device> 'chmod 755 /data/usb-eject.sh /data/rbp-shutdown.sh \
-                             /data/poweroff-hook.so /data/timeout'
+ssh root@<device> 'chmod 755 /data/usb-watch.sh /data/usb-eject.sh \
+                             /data/rec-stop.sh /data/stop-rbp \
+                             /data/rbp-shutdown.sh /data/poweroff-hook.so \
+                             /data/timeout'
 ```
 
 For one-button start, also deploy `/data/soundswitch-rbp.sh` and install the
@@ -346,7 +367,7 @@ Ask before driving hardware tests. The safe order is:
 | SoundSwitch does nothing in Engine | the button did not call `soundswitch.service`, or `/data/soundswitch-rbp.disable` exists | check `journalctl -u soundswitch.service` and `ls -l /data/soundswitch-rbp.disable`; re-verify the trigger before changing the hook |
 | SoundSwitch stops responding after the app was stopped manually over SSH | Engine still believes the SoundSwitch backend is open | return to a clean Engine state with `sh /data/stop-rbp-return-engine.sh` (or restart `engine.service`), then press once again |
 | rbp starts but Wi-Fi/SSH disappears during the session | observed once after a fresh boot; cause not yet confirmed | rbp keeps running; hold power ~6 s for the normal graceful teardown and reboot, then inspect `/data/soundswitch-rbp.log`, `/data/start-rb.log` and `/data/rbp-shutdown.log` |
-| rbp exits/crashes during a test | no crash evidence is kept by the normal launcher; `/tmp` is tmpfs and shim logs are deleted on the next start | reproduce with `sh /data/start-rb-crashdiag.sh`, then inspect `/data/rbp-diag/<timestamp>/crash.log` and the archived shim/rbp logs; report before power-cycling |
+| rbp exits/crashes during a test | no crash evidence is kept by the normal launcher; `/tmp` is tmpfs and shim logs are deleted on the next start | reproduce with `sh /data/start-rb-crashdiag.sh` (text logs + SIGSEGV `crash.log`) or `sh /data/start-rb-coredump.sh` (exit status/signal + a real core), then inspect `/data/rbp-diag/<timestamp>/`; report before power-cycling |
 
 ## 7. Files and logs
 
@@ -368,6 +389,9 @@ Ask before driving hardware tests. The safe order is:
 | `/data/enginex/bundle/boot-activate.sh.pre-soundswitch-rbp.<timestamp>` | backup made before patching `boot-activate.sh` |
 | `/data/soundswitch-rbp.disable` | optional flag: skip/remove the one-button hook |
 | `/data/start-rb-crashdiag.sh` | diagnostic launcher: adds `crashcatch.so`, keeps the power hook and `USBSTOP_*`, archives logs to `/data/rbp-diag/<timestamp>/` |
+| `/data/start-rb-coredump.sh` | crash-dump launcher: enables the stock `az01-coredump` helper, skips `crashcatch.so`, records rbp's exit status/signal and the core paths |
+| `/data/coredumps.enabled` | transient flag created/removed by `start-rb-coredump.sh`; enables the kernel core helper |
+| `<media>/Engine Library/coredumps/` | zstd cores + metadata written by `az01-coredump` (`/data/coredumps` when no media is mounted) |
 | `/data/rbp-diag/` | crash-diagnostic archives; `previous/` keeps the prior session's logs before the next start overwrites them |
 
 ## 8. Plan: 1 s graceful shutdown (not implemented)

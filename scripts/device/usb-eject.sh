@@ -1,6 +1,6 @@
 #!/bin/sh
 # =============================================================================
-# usb-eject.sh — safely stop and eject all removable USB mass-storage drives.
+# usb-eject.sh — safely stop and eject all removable media (USB sticks + SD).
 #
 # Triggered by the NH08S SHIFT + SoundSwitch gesture: knobshim2.c sends rbp's
 # native UsbStop keycode (0x8002) on the USB manager channels and writes
@@ -8,22 +8,24 @@
 # rbp is chrooted and cannot execute /data scripts directly.
 #
 # This script only does the OS-level work:
-#   1. stop usb-watch (so it cannot remount the stick mid-eject)
-#   2. notify rbp "umount /media/usb1/sda1" (PathDecider reset)
-#   3. sync, unmount every mount backed by a USB sdX device (including the
-#      chroot bind), with a lazy fallback
-#   4. power off / remove the device via udisksctl (if present) or the sysfs
-#      device/delete node
-#   5. restart usb-watch (unless --shutdown)
+#   1. stop usb-watch (so it cannot remount media mid-eject)
+#   2. close any active recording (/data/rec-stop.sh)
+#   3. notify rbp "umount ..." on both media FIFOs (PathDecider reset)
+#   4. sync, unmount every mount backed by a removable device (including both
+#      chroot binds), with a lazy fallback
+#   5. power off / remove the device via udisksctl or sysfs device/delete;
+#      an SD card has no delete node, so unmount + sync is reported as safe
+#   6. remember ejected devices in /tmp/usb-held until they disappear, so the
+#      restarted watcher does not immediately remount a card that stays in
+#      the slot
+#   7. restart usb-watch (unless --shutdown)
 #
 # Usage: sh /data/usb-eject.sh [--shutdown]
 # =============================================================================
 
 LOG=/data/usb-eject.log
 LKD=/tmp/usb-eject.lock.d
-FIFO=/tmp/udev_usb1
-MNT=/media/usb1/sda1
-CH_MNT=/data/rbx3-run/media/usb1/sda1
+HELD=/tmp/usb-held
 TIMEOUT=/data/timeout
 SHUTDOWN=0
 [ "${1:-}" = "--shutdown" ] && SHUTDOWN=1
@@ -55,27 +57,36 @@ echo $$ > "$LKD/pid"
 trap 'rm -rf "$LKD"' EXIT INT TERM HUP
 
 # --- device discovery -------------------------------------------------------
-# Any /sys/block/sd* whose sysfs path goes through a USB controller. Do not
-# require removable=1: USB-SATA bridges (the az01-usbsata-fixer case) report 0
-# but are still external media the user expects to eject.
+# USB: any /sys/block/sd* whose sysfs path goes through a USB controller. Do
+# not require removable=1: USB-SATA bridges (the az01-usbsata-fixer case)
+# report 0 but are still external media the user expects to eject.
+# SD: /sys/block/mmcblk* with device/type == "SD"; the internal eMMC reports
+# "MMC" and is never touched.
 #
-# Never touch a device that backs / or /data: deleting the running system's
-# disk would be unrecoverable. Prefix matching also covers its partitions.
+# Never touch a device that backs / or /data.
 is_system_dev() {
   for mp in / /data; do
     src=$(awk -v m="$mp" '$2 == m { print $1; exit }' /proc/mounts)
     case "$src" in
-      /dev/"$1"|/dev/"$1"[0-9]*) return 0 ;;
+      "/dev/$1"|"/dev/$1"[0-9]*|"/dev/$1"p[0-9]*) return 0 ;;
     esac
   done
   return 1
 }
 
-usb_devs() {
-  for blk in /sys/block/sd*; do
+media_devs() {
+  for blk in /sys/block/mmcblk* /sys/block/sd*; do
     [ -e "$blk" ] || continue
     dev=${blk##*/}
     is_system_dev "$dev" && continue
+    case "$dev" in
+      mmcblk*)
+        type=$(cat "$blk/device/type" 2>/dev/null)
+        [ "$type" = "SD" ] || continue
+        echo "$dev"
+        continue
+        ;;
+    esac
     tgt=$(readlink "$blk" 2>/dev/null) || continue
     case "$tgt" in
       *"/usb"*) echo "$dev" ;;
@@ -83,9 +94,14 @@ usb_devs() {
   done
 }
 
-# Mountpoints whose source is /dev/<dev> or /dev/<dev><partition>.
+# Mountpoints whose source is /dev/<dev>, /dev/<dev><partition> or
+# /dev/mmcblkXpN.
 mounted_from() {
-  awk -v d="$1" '$1 ~ ("^/dev/" d "[0-9]*$") { print $2 }' /proc/mounts
+  case "$1" in
+    mmcblk*) re="^/dev/${1}p[0-9]*\$" ;;
+    *)       re="^/dev/${1}[0-9]*\$" ;;
+  esac
+  awk -v re="$re" '$1 ~ re { print $2 }' /proc/mounts
 }
 
 umount_retry() {
@@ -106,10 +122,10 @@ umount_retry() {
 log "=== eject start (shutdown=$SHUTDOWN) ==="
 klog "start (shutdown=$SHUTDOWN)"
 
-devs=$(usb_devs)
+devs=$(media_devs)
 if [ -z "$devs" ]; then
-  log "no removable USB mass-storage devices attached"
-  klog "no USB drives attached"
+  log "no removable media attached"
+  klog "no media attached"
   # The watcher handed the role to us and exited, so resume hotplug here.
   if [ "$SHUTDOWN" = 0 ]; then
     sh /data/usb-watch.sh start >/dev/null 2>&1
@@ -119,35 +135,47 @@ if [ -z "$devs" ]; then
 fi
 log "devices: $devs"
 
-# Stop the watcher first so its 1 s poll cannot remount the stick while the
+# Stop the watcher first so its 1 s poll cannot remount media while the
 # mounts are being dropped. In the request flow it already exited and removed
 # its pidfile, so this is a no-op.
 sh /data/usb-watch.sh stop >/dev/null 2>&1
 
-# rbp already received UsbStop; this also resets its PathDecider state so a
-# reinserted stick is treated as new. rbp holds the FIFO open, so a normal
-# write cannot block; if the FIFO has no reader (shutdown path, or rbp gone),
+# Close the recording while the filesystem is still mounted and writable.
+if [ -x /data/rec-stop.sh ]; then
+  log "recording: requesting stop before unmount"
+  sh /data/rec-stop.sh >> "$LOG" 2>&1
+else
+  log "recording: /data/rec-stop.sh missing, cannot stop gracefully"
+fi
+
+# rbp already received UsbStop; this also resets its PathDecider state so
+# reinserted media is treated as new. rbp holds the FIFOs open, so a normal
+# write cannot block; if a FIFO has no reader (shutdown path, or rbp gone),
 # skip instead of blocking forever. The static `timeout` helper is used when
 # available: opening a FIFO O_WRONLY with no reader blocks in open(2).
-notify_rbp() {
-  [ -p "$FIFO" ] || return 0
+notify_fifo() {
+  fifo=$1
+  msg=$2
+  [ -p "$fifo" ] || return 0
   if [ -x "$TIMEOUT" ]; then
-    "$TIMEOUT" 3 sh -c 'printf "%s" "$1" > "$2"' sh "umount $MNT" "$FIFO" 2>/dev/null \
-      && { log "notify: umount $MNT"; return 0; }
+    "$TIMEOUT" 3 sh -c 'printf "%s" "$1" > "$2"' sh "$msg" "$fifo" 2>/dev/null \
+      && { log "notify: $msg -> $fifo"; return 0; }
   fi
   if ps -e -o pid,args 2>/dev/null | awk '/[r]oot\/pdj\/[r]bp/ { f=1 } END { exit !f }'; then
-    printf "%s" "umount $MNT" > "$FIFO" 2>/dev/null && log "notify: umount $MNT"
+    printf "%s" "$msg" > "$fifo" 2>/dev/null && log "notify: $msg -> $fifo"
   else
     log "notify: rbp not running, skipped"
   fi
 }
-notify_rbp
+notify_fifo /tmp/udev_usb1 "umount /media/usb1/sda1"
+notify_fifo /tmp/udev_usb2 "umount /media/usb4/sda1"
 sync
 sleep 0.5
 
 fail=0
 for dev in $devs; do
-  umount_retry "$CH_MNT" || fail=1
+  umount_retry /data/rbx3-run/media/usb1/sda1 || fail=1
+  umount_retry /data/rbx3-run/media/usb4/sda1 || fail=1
   for mp in $(mounted_from "$dev"); do
     umount_retry "$mp" || fail=1
   done
@@ -160,6 +188,9 @@ for dev in $devs; do
     fail=1
     continue
   fi
+
+  is_sd=0
+  case "$dev" in mmcblk*) is_sd=1 ;; esac
 
   removed=0
   if command -v udisksctl >/dev/null 2>&1; then
@@ -192,9 +223,19 @@ for dev in $devs; do
       log "/dev/$dev still present after delete"
       fail=1
     fi
+  elif [ "$is_sd" = 1 ]; then
+    log "/dev/$dev has no device/delete node (SD slot) - unmounted and synced, safe to remove"
   else
     log "no device/delete node for /dev/$dev"
     fail=1
+  fi
+done
+
+# Keep the restarted watcher from remounting a card that cannot be removed in
+# software. Entries are pruned by the watcher once the block device is gone.
+for dev in $devs; do
+  if [ -e "/sys/block/$dev" ] && ! grep -qx "$dev" "$HELD" 2>/dev/null; then
+    echo "$dev" >> "$HELD"
   fi
 done
 

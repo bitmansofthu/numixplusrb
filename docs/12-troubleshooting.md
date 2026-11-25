@@ -64,8 +64,14 @@ Symptom → cause → fix.
 | Stick ejects after ~30 s | `edisksd.service` running | stop it in the launcher |
 | SHIFT + SoundSwitch does nothing | SHIFT not held first, or the eject latch is still set | hold deck SHIFT, then press SoundSwitch; watch `/tmp/knobshim.log` with `KNOB_VERBOSE=1` ([15](15-nh08s-power-and-eject.md)) |
 | Only one deck stops on eject | parallel `UsbStop 0x8002` burst coalesced in rbp | restart rbp with `USBSTOP_SEQUENTIAL=1` (`USBSTOP_GAP_MS` to tune) ([15](15-nh08s-power-and-eject.md)) |
-| Eject reports `unmount FAILED` | a file in the mount is still open | stop playback/browser; the script retries lazily and still deletes the device. Full log: `/data/usb-eject.log` ([15](15-nh08s-power-and-eject.md)) |
+| Eject reports `unmount FAILED` | a file in the mount is still open | stop playback/browser; the script retries lazily and still releases the device. Full log: `/data/usb-eject.log` ([15](15-nh08s-power-and-eject.md)) |
 | Ejected stick remounts immediately | USB watcher restarted before the device disappeared, or `edisksd` is running | the watcher is stopped during eject; stop `edisksd` ([10](10-usb.md)) |
+| SD card not seen as USB2 | card inserted while `edisksd` owns it, or its `/sys/block/<dev>/device/type` is not `SD` | `sh /data/usb-watch.sh status` lists detected media and both slots; the internal eMMC (`MMC`) is deliberately ignored ([10](10-usb.md)) |
+| Ejected SD card remounts by itself | the card is still in the slot | expected: it stays in `/tmp/usb-held` until pulled and reinserted ([15](15-nh08s-power-and-eject.md)) |
+| SHIFT + right VINYL logs `REC NOT READY (no USB2 media)` | slot 2 has no card/stick, or `/tmp/usb-name-2` is missing | insert media and confirm `sh /data/usb-watch.sh status`; the shim gates on `/tmp/usb-name-2` ([10](10-usb.md)) |
+| SHIFT + right VINYL logs `prepare timeout` / `start timeout` | target not writable, less than ~32 MB free, or 999 files already used | check `/tmp/knobshim.log`, free space on `PIONEER REC/` and the file count ([08](08-controls.md#master-mix-recording-to-usb2-nh08s)) |
+| REC icon invisible but a WAV keeps growing | on-screen status reads the engine, which is recording; the icon may not repaint until the next UI tick | stop with the same gesture and check `/tmp/knobshim.log` for `REC START`/`REC STOP` ([08](08-controls.md#master-mix-recording-to-usb2-nh08s)) |
+| `RECTMP.WAV` left after removing a card | recording was cut without the mailbox stop | always eject with SHIFT + SoundSwitch or the power button; `/data/rec-stop.sh` finalises the WAV first ([15](15-nh08s-power-and-eject.md)) |
 
 ## Power button
 
@@ -106,7 +112,13 @@ Symptom → cause → fix.
 ## Diagnostic tools
 
 * `tools/touchdump` (static ARM) — ILI2117 ranges + live events.
-* `crashcatch.so` — SIGSEGV `pc`/`lr` → `/tmp/crash.log`.
+* `crashcatch.so` — SIGSEGV only: `pc`/`lr` → `/tmp/crash.log`; its handler
+  exits the process, so it also suppresses the kernel core for that signal.
+* `/data/start-rb-coredump.sh` — crash-dump launcher: enables the stock
+  `az01-coredump` helper, skips `crashcatch.so`, records rbp's exit
+  status/signal and dmesg, and lists this run's cores in
+  `/data/rbp-diag/<timestamp>/exit-status.txt`. Cores are zstd files under
+  `<media>/Engine Library/coredumps/` (or `/data/coredumps` with no media).
 * `KNOB_VERBOSE=1` → every MIDI event + keycode in `/tmp/knobshim.log`.
 * `cat /tmp/audioshim.log` — negotiated params + `sg`/peaks.
 * `cat /tmp/dfbdig*.log` — DirectFB bring-up (`ROTINIT` line).

@@ -99,6 +99,7 @@ Read from `NH08S_Controller_Assignments.qml` and implemented in
 | Jog touch | note 33 | `0x4306` |
 | Jog rotate | CC **`0x37` hi + `0x4D` lo** | `0x4305`; 1638 hardware counts/rev → **3600 rbp pulses/rev** (see below) |
 | Wheel | note 35 | `0x4104` VINYL (Shift: scratch) |
+| **SHIFT + Wheel (right deck only)** | note 35 + Shift n28 | start/stop **master-mix recording to USB2** (normally the SD card); the shifted press/release is swallowed, plain VINYL is unchanged (see below) |
 | Shift | note 28 | modifier for CUE / SYNC / pitch bend / Wheel / FX select / pads; also gates Settings → SHORTCUT and VIEW → SEARCH. Sends rbp's internal `0x4103` on the deck channel (see pads below) |
 | Pitch fader | CC `0x1F` + `0x4B` | `0x4109`; top = faster (**opposite of JP21**, whose QML has `invert: true`) |
 
@@ -657,6 +658,43 @@ The NH08S map has no SOURCE key. `knobshim2.c` adds:
 Details and the measured state variables are in [10 — USB](10-usb.md). The
 eject gesture and the power-button hook are in
 [15 — NH08S power and eject](15-nh08s-power-and-eject.md).
+
+### Master-mix recording to USB2 (NH08S)
+
+**SHIFT + right-deck Wheel (ch3 note 35)** toggles recording of the master mix.
+rbp's native REC key is not usable here: it only arms for a USB2 device whose
+rekordbox export is attached. Instead `knobshim2.c` drives
+`mixerengine::MixerEngine` directly:
+
+```
+prepareRecording("/media/usb4/sda1/PIONEER REC", 0)
+  -> poll WavWriter +149 (prepare accepted)
+  -> startRecording()
+  -> poll WavWriter +156 (recording active)
+stopRecording() -> writer renames RECTMP.WAV to REC###.WAV
+```
+
+The gesture is deck 2 only and swallows just the shifted press/release: plain
+VINYL still toggles vinyl mode, SHIFT + left-deck VINYL is untouched, and JP21
+is unaffected. The target is whatever `usb-watch.sh` placed in **slot 2**
+(`/media/usb4/sda1`, normally the SD card).
+
+Behaviour and limits:
+
+* Files appear as `RECTMP.WAV` while recording and become `REC001.WAV` (next
+  free number) on stop. ~32 MB free space is required; numbering stops at
+  `REC999.WAV`, and rbp ends a recording at ~3 hours.
+* rbp's **status-bar REC icon and REC timer follow the engine state**, so both
+  work with this path. Native error popups (`USB FULL`, `NO USB`, `NOT READY`)
+  do **not**, because they are emitted by rbp's native REC path; failures are
+  logged to `/tmp/knobshim.log` (`REC NOT READY`, `prepare timeout`,
+  `start timeout`).
+* TRACK MARK stays usable while recording (rbp gates it on the same engine
+  status).
+* Before any unmount or power teardown the host asks the shim to stop via
+  `/tmp/rec-stop.req` → `/tmp/rec-stop.ack` (`/data/rec-stop.sh`), so the WAV
+  is finalised instead of being cut mid-write. See
+  [15 — NH08S power and eject](15-nh08s-power-and-eject.md).
 
 Controls the SC Live 4 has that the RX3 does not (or vice versa):
 
