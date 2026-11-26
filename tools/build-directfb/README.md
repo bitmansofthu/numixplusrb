@@ -130,8 +130,12 @@ done
 * The modules must be soft-float and reference only `GLIBC_2.4`/`GLIBC_2.7`.
 * Do not set `layer-size` in `directfbrc` (historically caused a 2×/half-width
   bug); do not rely on `layer-rotate` (unimplemented).
-* The diff/sources include **debug instrumentation** (many
-  `fopen("/tmp/dfbdig*.log", …)` blocks). It is harmless but noisy; delete
-  those blocks for a production build. They are not required for the fix.
+* The diff/sources still include **debug instrumentation**: one-shot
+  `fopen("/tmp/dfbdig*.log", …)` blocks (startup/probe/API tracing) and an
+  `IDirectFBEventBuffer_GetEvent()` trace. These are not needed for the fix.
+  The expensive per-flip `/tmp/rot_surface.dump` write, the per-flip/per-lock
+  `/tmp/dfbdig9.log` lines and the one-shot `/tmp/win_surface.dump` writes
+  have been removed from `fbdev.c` and `fbdev_surface_pool.c`; do not
+  reintroduce them.
 * The rotation direction is read from `DFB_ROTATE` (`left`/`right`/`180`) in
   `system_initialize`; rblive4 runs with `DFB_ROTATE=left`.

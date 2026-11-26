@@ -472,7 +472,7 @@ index 36c295e..748b22e 100644
                 if (ret)
                      return ret;
            }
-@@ -1485,11 +1685,44 @@ primaryFlipRegion( CoreLayer             *layer,
+@@ -1485,11 +1685,42 @@ primaryFlipRegion( CoreLayer             *layer,
           !dfb_config->pollvsync_after)
            dfb_screen_wait_vsync( dfb_screens_at(DSCID_PRIMARY) );
  
@@ -494,8 +494,6 @@ index 36c295e..748b22e 100644
 +          int fh  = shared->rot_fh;
 +          int fpitch = shared->rot_fpitch;
 +          int idx = 0;
-+          { FILE*f=fopen("/tmp/dfbdig9.log","a"); if(f){fprintf(f,"flip: rot_deg=%d cfg=%dx%d lock.pitch=%d off=%d\n",shared->rot_deg,sw,sh,lock->pitch,(int)lock->offset); fclose(f);} }
-+          { FILE*f=fopen("/tmp/rot_surface.dump","wb"); if(f){ fwrite(shared->rot_surface,1,(size_t)shared->rot_surface_size,f); fclose(f);} }
 +
 +          if (spitch > 0 && sh > 0)
 +               idx = lock->offset / (spitch * sh);
@@ -750,7 +748,7 @@ diff --git a/systems/fbdev/fbdev_surface_pool.c b/systems/fbdev/fbdev_surface_po
 index 65ef3d7..5c9dd81 100644
 --- a/systems/fbdev/fbdev_surface_pool.c
 +++ b/systems/fbdev/fbdev_surface_pool.c
-@@ -362,8 +362,21 @@ fbdevLock( CoreSurfacePool       *pool,
+@@ -362,8 +362,20 @@ fbdevLock( CoreSurfacePool       *pool,
  
            D_DEBUG_AT( FBDev_Surfaces, "  -> primary layer buffer (index %d)\n", index );
  
@@ -770,19 +768,15 @@ index 65ef3d7..5c9dd81 100644
 +               lock->pitch  = shared->fix.line_length;
 +               lock->offset = index * allocation->config.size.h * lock->pitch;
 +          }
-+          { FILE*f=fopen("/tmp/dfbdig9.log","a"); if(f){fprintf(f,"pool: lock idx=%d cfg=%dx%d pitch=%d off=%d rot=%d\n",index,allocation->config.size.w,allocation->config.size.h,lock->pitch,(int)lock->offset,dfb_fbdev->shared->rot_deg); fclose(f);} }
  #if D_DEBUG_ENABLED
            allocation->offset = lock->offset;
  #endif
-@@ -373,11 +386,26 @@ fbdevLock( CoreSurfacePool       *pool,
+@@ -373,11 +386,21 @@ fbdevLock( CoreSurfacePool       *pool,
  
            lock->pitch  = alloc->chunk->pitch;
            lock->offset = alloc->chunk->offset;
 +
-+          /* dump first non-primary surface for diagnosis (addr computed: fb mem) */
-+          { static int dumps=0; if (dumps < 1) { void *a = (char*)dfb_fbdev->framebuffer_base + lock->offset; FILE*f=fopen("/tmp/win_surface.dump","wb"); if(f){ fprintf(f,"T=0x%x CFG=%dx%d P=%d\n", allocation->type, allocation->config.size.w, allocation->config.size.h, lock->pitch); fwrite(a,1,4096000,f); fclose(f);} dumps++; } }
       }
-+     { FILE*f=fopen("/tmp/dfbdig9.log","a"); if(f){fprintf(f,"pool: NONPRIMARY cfg=%dx%d pitch=%d off=%d\n",allocation->config.size.w,allocation->config.size.h,lock->pitch,(int)lock->offset); fclose(f);} }
  
       lock->addr = dfb_fbdev->framebuffer_base + lock->offset;
       lock->phys = dfb_fbdev->shared->fix.smem_start + lock->offset;
@@ -794,8 +788,6 @@ index 65ef3d7..5c9dd81 100644
 +         dfb_fbdev->shared->rot_deg && dfb_fbdev->shared->rot_surface)
 +          lock->addr = (char*)dfb_fbdev->shared->rot_surface + lock->offset;
 +
-+     /* dump first non-primary surface for diagnosis */
-+     { static int dumps=0; if (!(allocation->type & CSTF_LAYER) && dumps < 1 && lock->addr) { FILE*f=fopen("/tmp/win_surface.dump","wb"); if(f){ fprintf(f,"TYPE=0x%x CFG=%dx%d PITCH=%d\n", allocation->type, allocation->config.size.w, allocation->config.size.h, lock->pitch); fwrite(lock->addr,1,4096000,f); fclose(f);} dumps++; } }
 +
 +
       D_DEBUG_AT( FBDev_SurfLock, "  -> offset %lu, pitch %d, addr %p, phys 0x%08lx\n",

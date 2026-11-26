@@ -82,3 +82,10 @@ first DirectFB surface setup is unreliable.
   Pro Plus that renders the UI **upside down**, so `start-rb.sh` defaults to
   `DFB_ROTATE=right` there. Override with `DFB_ROTATE=left|right` for other
   panels. A wrong value shows the UI sideways or inverted, not garbled.
+* The patched fbdev module no longer writes `/tmp/rot_surface.dump` (6 MB per
+  flip) or logs every flip/surface lock to `/tmp/dfbdig9.log`. The one-shot
+  startup/probe logs remain. When rebuilding the module, remember the
+  `patchelf --replace-needed ...so.6 ...so.0` step from
+  `tools/build-directfb/README.md`: without it the module asks for
+  `libdirect-1.4.so.6`, DirectFB fails to load it, and rbp segfaults in
+  `DS_HW_Glib3_DFB.c`.
