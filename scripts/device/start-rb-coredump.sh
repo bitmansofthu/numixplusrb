@@ -15,10 +15,16 @@
 # The power-button hook and USBSTOP_* pass-through are kept.
 #
 # Manual use (do not wire this into soundswitch.service):
-#   nohup setsid sh /data/start-rb-coredump.sh </dev/null \
-#         >/data/start-rb-console.log 2>&1 &
+#   nohup setsid sh /data/start-rb-coredump.sh &
+# The script writes its own console output to /data/start-rb-console.log, so
+# no output redirections or pipes are needed on the command line.
 # If the launcher itself is killed with SIGKILL, remove
 # /data/coredumps.enabled by hand before returning to Engine OS.
+
+# Capture this launcher's own output without relying on the caller to add
+# ">/data/start-rb-console.log 2>&1".  The file is truncated at each start;
+# per-run crash diagnostics still go to $RUN_DIR.
+exec >/data/start-rb-console.log 2>&1
 
 DIAG_ROOT=/data/rbp-diag
 RUN_ID=$(date +%Y%m%d%H%M%S)
