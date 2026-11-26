@@ -1447,7 +1447,8 @@ static void handle_note(int ch, int note, int on)
      }
 
      /* SYNC (deck note 8): tap = SYNC, hold = MASTER.  The SC Live 4 has no
-      * MASTER button, and rbp keeps the two keycodes distinct.
+      * MASTER button, and rbp keeps the two keycodes distinct.  SHIFT is
+      * deliberately ignored here: long-hold is the single MASTER gesture.
       *
       * We deliberately send NOTHING on note-on.  If we sent the SYNC press
       * early and then suppressed the release for a hold, rbp saw a stuck SYNC
@@ -1457,34 +1458,13 @@ static void handle_note(int ch, int note, int on)
       * press (op 0). */
      if (deck_of_ch(ch) >= 0 && note == 8) {
           int d = deck_of_ch(ch);
-          /* SHIFT + SYNC toggles the deck's sync master: rbp's onKey_Master
-           * (0x4111) maps to DjEngineIF::setSyncMaster and acts only on
-           * OP_PRESS, so it is sent as a one-shot press/release.  The sync
-           * release is swallowed (sync_shift latch) and the hold-to-master
-           * timer is disarmed so it cannot send a second MASTER. */
-          static int sync_shift[2];
           if (on) {
-               if (g_nh08s && shift_down) {
-                    sync_held[d] = 0;
-                    if (!sync_shift[d]) {
-                         sync_shift[d] = 1;
-                         sync_hold_fired[d] = 1;
-                         send_rx_key(K_MASTER, OP_PRESS, d + 1, 0);
-                         send_rx_key(K_MASTER, OP_RELEASE, d + 1, 0);
-                         klog("knobshim2: deck %d shift+SYNC -> MASTER 0x4111\n",
-                              d + 1);
-                    }
-               } else {
-                    sync_shift[d] = 0;
-                    sync_press_ms[d] = now_ms();
-                    sync_hold_fired[d] = 0;
-                    sync_held[d] = 1;
-               }
+               sync_press_ms[d] = now_ms();
+               sync_hold_fired[d] = 0;
+               sync_held[d] = 1;
           } else {
                sync_held[d] = 0;
-               if (sync_shift[d]) {
-                    sync_shift[d] = 0;   /* MASTER already toggled on press */
-               } else if (!sync_hold_fired[d]) {
+               if (!sync_hold_fired[d]) {
                     send_rx_key(K_SYNC, OP_PRESS, d + 1, 0);
                     send_rx_key(K_SYNC, OP_RELEASE, d + 1, 0);
                }

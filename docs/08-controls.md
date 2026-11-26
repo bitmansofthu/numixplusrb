@@ -89,7 +89,7 @@ Read from `NH08S_Controller_Assignments.qml` and implemented in
 | Control | MIDI | rbp keycode |
 |---|---|---|
 | LOAD left / right | **note 1 / 2 on ch15** (measured; the QML nests Load in the deck block but the panel sends global ch15) | `0x4311` K_LOAD (deck 1 / 2) |
-| SYNC | note 8 | `0x4112` (hold → MASTER; **SHIFT + SYNC → `0x4111` K_MASTER**, toggles the sync master) |
+| SYNC | note 8 | `0x4112` tap; hold → `0x4111` K_MASTER (sync master). SHIFT is ignored for this gesture. |
 | CUE | note 9 | `0x4102`; **SHIFT + CUE → `0x4215` K_TRREV** (previous track / back to track start), deck-scoped |
 | PLAY / PAUSE | note 10 | `0x4101` |
 | Pad mode 1 / 2 / 3 / 4 | notes 11 / 12 / 14 / 13 | `0x4113` HOT CUE, `0x4114` LOOPS, `0x4115` ROLL, `0x4116` BEAT JUMP |
