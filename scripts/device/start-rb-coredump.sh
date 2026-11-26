@@ -12,6 +12,9 @@
 # The kernel core_pattern is "|/usr/bin/az01-coredump ..."; the helper zstd
 # compresses the core and writes it to the first attached media's
 # "Engine Library/coredumps/<folder>/" (or /data/coredumps when no media).
+# With the usb watcher's bind mounts active, choose-dump-directory can emit
+# several mount targets; the helper then uses only its first line and drops
+# the core at the USB root.  The core search below covers both locations.
 # The power-button hook and USBSTOP_* pass-through are kept.
 #
 # Manual use (do not wire this into soundswitch.service):
@@ -218,9 +221,12 @@ CORES=$RUN_DIR/cores.txt
 : > "$CORES"
 for d in "/media/usb1/sda1/Engine Library/coredumps" \
          "/media/usb4/sda1/Engine Library/coredumps" \
+         /media/usb1/sda1 /media/usb4/sda1 \
          /data/coredumps; do
     [ -d "$d" ] || continue
-    find "$d" -type f -newer "$STAMP" 2>/dev/null >> "$CORES"
+    find "$d" -type f -newer "$STAMP" \
+         \( -name '*.core' -o -name '*.core.zst' -o -name '*.metadata' \
+            -o -name '*.log.zst' \) 2>/dev/null >> "$CORES"
 done
 dmesg > "$RUN_DIR/dmesg.txt" 2>/dev/null
 {
@@ -247,6 +253,8 @@ dmesg > "$RUN_DIR/dmesg.txt" 2>/dev/null
     fi
     printf 'searched: /media/usb1/sda1/Engine Library/coredumps\n'
     printf '          /media/usb4/sda1/Engine Library/coredumps\n'
+    printf '          /media/usb1/sda1 (root, bind-mount fallback)\n'
+    printf '          /media/usb4/sda1 (root, bind-mount fallback)\n'
     printf '          /data/coredumps\n'
 } > "$RUN_DIR/exit-status.txt" 2>/dev/null
 cat "$RUN_DIR/exit-status.txt" 2>/dev/null

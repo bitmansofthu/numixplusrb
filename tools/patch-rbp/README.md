@@ -11,8 +11,16 @@ python3 rbp_patch.py /path/to/stock/rbp --check
 
 # produce the patched player
 python3 rbp_patch.py /path/to/stock/rbp -o rbp-audio
+
+# optional: also apply the BeatSync NULL-BeatPosInfo crash fix
+python3 rbp_patch.py /path/to/stock/rbp -o rbp-audio-beatsync \
+    --fix-beat-sync-null
 ```
 
+* `--fix-beat-sync-null` is opt-in and changes the canonical output hash. It
+  makes `duplicateMaster()` skip NULL `BeatPosInfo` stores and routes the four
+  `BeatPosInfo+0x24` reads through a null-safe cave. See
+  [`docs/12-troubleshooting.md`](../../docs/12-troubleshooting.md).
 * Idempotent — safe to re-run on an already patched binary.
 * Validates the expected stock instruction at every address; a wrong or
   foreign binary is rejected rather than corrupted.

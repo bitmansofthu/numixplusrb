@@ -55,6 +55,24 @@ Symptom → cause → fix.
 | SHIFT + pad does not delete a hot cue | `(1<<16)|keycode` only stores the low 16 bits in `IKeyInput+0x8`, so rbp never sees SHIFT | send `0x4103` press/release on the deck channel while note 28 is held; `sendKey()`'s `isPressed(0x4103, ch)` makes `pad_HotCue()` clear the cue ([08](08-controls.md)) |
 | All four pads dark / wrong in HOT CUE mode | rbp's `LedStat` ids 18–25 were not mirrored, or the panel needs `LedType.Simple` velocities | use Note On `0x7f` / Note Off `0x00`, state 2 = blink ([08](08-controls.md)) |
 
+## Beat sync / audio-thread crashes
+
+### SIGSEGV in `playengine::BeatSync::checkPrecision()` (NH08S, 2026-11-26 12:06 UTC)
+
+- Core: `/media/usb1/sda1/JuceALSA.2026-11-26T120600Z.core.zst` (plus `.metadata` and `.log.zst`), PID 832, `signal=11`.
+- Stack: `djengine::DjEngineIF::audioDeviceIOCallback` → `playengine::SyncMgr::sync` → `BeatSync::checkAllPrecision` → `checkPrecision`; fault at `0x7c404`, `ldr r2, [r3, #0x24]` with `r3 = 0`.
+- `BeatSync` keeps two 88-byte `BeatSyncInfo` records: `+0` is `Player*`, `+4` is the cached `Player::getBeatPosInfo()` pointer. Deck 1's pointer is valid; deck 2's is NULL.
+- Deck 2 also has `Player::readerOwner.reader == NULL` (deck 1's is valid). `getBeatPosInfo()` returns `reader->beatPos` via `ReaderOwner +4` then `+0x69c`, so with no loaded reader it returns NULL.
+- `BeatSync::duplicateMaster()` (`0x7ca08`) stores that NULL at `BeatSyncInfo[1]+4` and still arms the precision path; the audio thread dereferences it on the next callback.
+- Timing: USB detach/attach and `export.pdb` reopen at 12:05:01–12:05:34, then SOURCE/BACK/BROWSE and deck-2 PLAY (`0x4101`) immediately before the crash. Earlier USB-only sessions without deck-2 PLAY did not crash.
+- The function is byte-identical to stock `extracted/rbp-audio`; this is **not** caused by our rbp patch, the shims, or the DirectFB/fbdev work.
+
+**Minimal fix (crash suppression):** a NULL guard on the four `ldr ..., [BeatPosInfo, #0x24]` sites — `checkPrecision()` at `0x7c310` / `0x7c404` and `calcBeatDifference()` at `0x7d3a4` / `0x7d484`. A 24-byte ARM code cave checks the pointer and sets the loaded value to 0, letting the existing `cmp ..., #0` path skip the precision correction. This stops the SIGSEGV but leaves the stale sync state, so the correction is silently skipped.
+
+**Root-cause fix (preferred):** in `duplicateMaster()` (`0x7caa8`, `0x7cc78`, `0x7ccf4`) make the cached `getBeatPosInfo()` stores conditional so a NULL pointer is never written to `BeatSyncInfo+4`. The optional patch combines this with the NULL-safe cave above, so an already-armed `+25`/`+49` precision gate cannot crash the audio thread even if the pointer was left NULL by another path. `syncBeat()`'s own dereferences (`0x7b4ac`, `0x7b558`, `0x7b570`, `0x7b6a4`) are already behind a reader-ready check.
+
+Both changes are implemented in `tools/patch-rbp/rbp_patch.py` behind the opt-in flag `--fix-beat-sync-null`; they are **not** part of the standard build. No patched binary has been built or deployed; rbp was restarted unchanged for further observation.
+
 ## USB
 
 | Symptom | Cause | Fix |
@@ -119,6 +137,9 @@ Symptom → cause → fix.
   status/signal and dmesg, and lists this run's cores in
   `/data/rbp-diag/<timestamp>/exit-status.txt`. Cores are zstd files under
   `<media>/Engine Library/coredumps/` (or `/data/coredumps` with no media).
+  With the USB watcher's bind mounts, `choose-dump-directory` can print
+  several mount targets and `az01-coredump` uses only the first line, so the
+  core can land at the USB root instead; the launcher now searches both.
 * `KNOB_VERBOSE=1` → every MIDI event + keycode in `/tmp/knobshim.log`.
 * `cat /tmp/audioshim.log` — negotiated params + `sg`/peaks.
 * `cat /tmp/dfbdig*.log` — DirectFB bring-up (`ROTINIT` line).

@@ -147,3 +147,26 @@ paths move to `/tmp` (shared with the chroot).
 |---|---|
 | `0x104d0` | stock audio-init branch is already correct; do not bypass it |
 | `0x1a4204/08` | the old RGB32 window patch is obsolete — the working display uses RGB16 surfaces + the patched fbdev driver |
+
+## 11. Optional BeatSync NULL fix (`--fix-beat-sync-null`)
+
+Not part of the standard build. Enable explicitly with `--fix-beat-sync-null`;
+see [`docs/12-troubleshooting.md`](../../docs/12-troubleshooting.md) for the
+2026-11-26 crash analysis.
+
+| VA | stock | patched | purpose |
+|---|---|---|---|
+| `0x07caa8` | `E5820004` | `15820004` | `duplicateMaster` store 1 → `strne` (never cache NULL) |
+| `0x07cc78` | `E5880004` | `15880004` | `duplicateMaster` store 2 → `strne` |
+| `0x07ccf4` | `E5880004` | `15880004` | `duplicateMaster` store 3 → `strne` |
+| `0x07c30c` | `E5923004` | `E1A0C00E` | `checkPrecision` site 1: `mov ip,lr` |
+| `0x07c310` | `E5932024` | `EA007D4E` | `checkPrecision` site 1 → null-guard cave |
+| `0x07c400` | `E5923004` | `E1A0C00E` | `checkPrecision` site 2: `mov ip,lr` |
+| `0x07c404` | `E5932024` | `EA007D11` | `checkPrecision` site 2 → null-guard cave |
+| `0x07d3a0` | `E5983004` | `E1A0C00E` | `calcBeatDifference` site 1: `mov ip,lr` |
+| `0x07d3a4` | `E5932024` | `EA007929` | `calcBeatDifference` site 1 → null-guard cave |
+| `0x07d480` | `E5953004` | `E1A0C00E` | `calcBeatDifference` site 2: `mov ip,lr` |
+| `0x07d484` | `E5932024` | `EA0078F1` | `calcBeatDifference` site 2 → null-guard cave |
+
+Cave at `0x09b850` (24 bytes): `ldr r3,[r2,#4]`, `cmp r3,#0`,
+`moveq r2,#0`, `ldrne r2,[r3,#0x24]`, `cmp r2,#0`, `bx ip`.

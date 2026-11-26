@@ -13,9 +13,14 @@ by rblive4 (display, touch, controls, USB and audio all working).
 
 Usage:
     python3 rbp_patch.py <stock-rbp> [-o rbp-audio] [--check]
+                         [--fix-beat-sync-null]
 
     --check   only verify that the input already has / can take the patches;
               do not write an output file.
+    --fix-beat-sync-null
+              opt in to the BeatSync NULL-BeatPosInfo fix described in
+              docs/12-troubleshooting.md.  It is NOT part of the standard
+              build and is not applied unless this flag is given.
 
 Notes:
     * rbp is a non-PIE ARM32 ELF.  virtual address (VA) = file offset + 0x8000.
@@ -23,6 +28,7 @@ Notes:
       no-op ("already patched") and never double-applies.
     * Every patch records the expected *stock* word so a wrong/foreign binary
       is rejected instead of corrupted.
+    * The optional BeatSync fix uses the 24-byte zero cave at VA 0x09b850.
 """
 import argparse
 import struct
@@ -120,6 +126,86 @@ PATCHES = [
     (0x4E0E78, 0x0000326E, 0x00000032, "udev: ctn2 path (5/5)"),
 ]
 
+# Optional root-cause fix for the NH08S 2026-11-26 12:06 SIGSEGV.
+# Not part of the canonical rbp-audio build; enabled only with
+# --fix-beat-sync-null.
+#
+# duplicateMaster() caches Player::getBeatPosInfo() at BeatSyncInfo+4.  A deck
+# with no loaded reader returns NULL, yet an already-armed precision gate can
+# still call checkPrecision(), which dereferences BeatPosInfo+0x24 in the audio
+# thread.  The first three patches make those stores conditional so NULL is
+# never cached.  The remaining patches route the four BeatPosInfo+0x24 loads
+# through a null-safe cave, so a stale gate cannot crash even if the pointer
+# was cleared or left NULL by another path.
+BEATSYNC_GUARD_CAVE = 0x09B850
+BEATSYNC_GUARD_CAVE_WORDS = [
+    0xE5923004,  # ldr   r3, [r2, #4]      (load moved out of the call site)
+    0xE3530000,  # cmp   r3, #0
+    0x03A02000,  # moveq r2, #0
+    0x15932024,  # ldrne r2, [r3, #0x24]
+    0xE3520000,  # cmp   r2, #0            (flags for the original compare)
+    0xE12FFF1C,  # bx    ip                (ip holds the call-site return)
+]
+
+BEATSYNC_NULL_FIX_PATCHES = [
+    # duplicateMaster(): never cache a NULL BeatPosInfo pointer.
+    (0x07CAA8, 0xE5820004, 0x15820004,
+     "beatsync: duplicateMaster store 1 -> strne r0,[r2,#4]"),
+    (0x07CC78, 0xE5880004, 0x15880004,
+     "beatsync: duplicateMaster store 2 -> strne r0,[r8,#4]"),
+    (0x07CCF4, 0xE5880004, 0x15880004,
+     "beatsync: duplicateMaster store 3 -> strne r0,[r8,#4]"),
+
+    # checkPrecision(): copy lr to ip, then branch to the null-safe cave.
+    (0x07C30C, 0xE5923004, 0xE1A0C00E,
+     "beatsync: checkPrecision site 1 save lr in ip"),
+    (0x07C310, 0xE5932024, 0xEA007D4E,
+     "beatsync: checkPrecision site 1 -> null-guard cave"),
+    (0x07C400, 0xE5923004, 0xE1A0C00E,
+     "beatsync: checkPrecision site 2 save lr in ip"),
+    (0x07C404, 0xE5932024, 0xEA007D11,
+     "beatsync: checkPrecision site 2 -> null-guard cave"),
+
+    # calcBeatDifference(): same treatment for its two loads.
+    (0x07D3A0, 0xE5983004, 0xE1A0C00E,
+     "beatsync: calcBeatDifference site 1 save lr in ip"),
+    (0x07D3A4, 0xE5932024, 0xEA007929,
+     "beatsync: calcBeatDifference site 1 -> null-guard cave"),
+    (0x07D480, 0xE5953004, 0xE1A0C00E,
+     "beatsync: calcBeatDifference site 2 save lr in ip"),
+    (0x07D484, 0xE5932024, 0xEA0078F1,
+     "beatsync: calcBeatDifference site 2 -> null-guard cave"),
+]
+
+BEATSYNC_NULL_FIX_PATCHES += [
+    (BEATSYNC_GUARD_CAVE + 4 * i, 0x00000000, word,
+     f"beatsync: null-guard cave word {i + 1}/{len(BEATSYNC_GUARD_CAVE_WORDS)}")
+    for i, word in enumerate(BEATSYNC_GUARD_CAVE_WORDS)
+]
+
+
+def apply_patches(data: bytearray, patches, label: str):
+    """Apply one patch table in place. Return (applied, already) or None."""
+    applied = already = 0
+    for va, old, new, note in patches:
+        off = va - LOAD_BIAS
+        if off < 0 or off + 4 > len(data):
+            print(f"  !! [{label}] VA 0x{va:06x} outside file", file=sys.stderr)
+            return None
+        cur = struct.unpack_from("<I", data, off)[0]
+        if cur == new:
+            already += 1
+            continue
+        if cur != old:
+            print(f"  !! [{label}] mismatch at VA 0x{va:06x}: expected "
+                  f"0x{old:08x}, found 0x{cur:08x}  ({note})", file=sys.stderr)
+            print("     wrong rbp version or already modified by another tool",
+                  file=sys.stderr)
+            return None
+        struct.pack_into("<I", data, off, new)
+        applied += 1
+    return applied, already
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -129,32 +215,35 @@ def main() -> int:
                     help="output path (default: rbp-audio)")
     ap.add_argument("--check", action="store_true",
                     help="verify only, do not write anything")
+    ap.add_argument("--fix-beat-sync-null", action="store_true",
+                    help="apply the optional BeatSync NULL-BeatPosInfo fix "
+                         "(see docs/12-troubleshooting.md)")
     args = ap.parse_args()
 
     with open(args.rbp, "rb") as fh:
         data = bytearray(fh.read())
 
-    applied = already = 0
-    for va, old, new, note in PATCHES:
-        off = va - LOAD_BIAS
-        if off < 0 or off + 4 > len(data):
-            print(f"  !! VA 0x{va:06x} outside file", file=sys.stderr)
+    base = apply_patches(data, PATCHES, "base")
+    if base is None:
+        return 2
+    applied, already = base
+
+    opt_applied = opt_already = 0
+    if args.fix_beat_sync_null:
+        opt = apply_patches(data, BEATSYNC_NULL_FIX_PATCHES, "beatsync")
+        if opt is None:
             return 2
-        cur = struct.unpack_from("<I", data, off)[0]
-        if cur == new:
-            already += 1
-            continue
-        if cur != old:
-            print(f"  !! mismatch at VA 0x{va:06x}: expected 0x{old:08x}, "
-                  f"found 0x{cur:08x}  ({note})", file=sys.stderr)
-            print("     wrong rbp version or already modified by another tool",
-                  file=sys.stderr)
-            return 2
-        struct.pack_into("<I", data, off, new)
-        applied += 1
+        opt_applied, opt_already = opt
 
     print(f"[+] patches: {applied} applied, {already} already present, "
           f"{len(PATCHES)} total")
+    if args.fix_beat_sync_null:
+        print(f"[+] beatsync null fix: {opt_applied} applied, "
+              f"{opt_already} already present, "
+              f"{len(BEATSYNC_NULL_FIX_PATCHES)} total")
+    else:
+        print("[i] optional BeatSync NULL fix not applied "
+              "(use --fix-beat-sync-null)")
     if args.check:
         print("[i] --check only, no output written")
         return 0
